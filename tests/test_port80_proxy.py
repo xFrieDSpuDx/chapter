@@ -4,6 +4,8 @@ import importlib.machinery
 import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 PROXY_PATH = Path(__file__).resolve().parents[1] / "deploy" / "audiobookshelf-player-port80-proxy"
@@ -59,6 +61,22 @@ class Port80ProxyTest(unittest.TestCase):
 
         self.assertEqual(handler.wfile.data, b"data: one\n\ndata: two\n\n")
         self.assertEqual(handler.wfile.flushes, 2)
+
+    def test_proxy_closes_the_upstream_socket_after_a_timeout(self) -> None:
+        proxy = load_proxy_module()
+        handler = object.__new__(proxy.ProxyHandler)
+        handler.server = SimpleNamespace(target_host="127.0.0.1", target_port=47831)
+        handler.headers = {}
+        handler.path = "/library"
+        handler.command = "GET"
+        handler.send_error = Mock()
+
+        with patch.object(proxy.http.client, "HTTPConnection") as connection:
+            connection.return_value.getresponse.side_effect = TimeoutError("timed out")
+            handler.proxy()
+        handler.send_error.assert_called_once()
+        self.assertEqual(handler.send_error.call_args.args[0], 502)
+        connection.return_value.close.assert_called_once()
 
 
 if __name__ == "__main__":
