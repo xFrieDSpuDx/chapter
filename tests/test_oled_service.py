@@ -1,94 +1,88 @@
 from __future__ import annotations
 
-import unittest
 import queue
 import tempfile
+import threading
+import time
+import unittest
+from concurrent.futures import Future
+from datetime import datetime
+from http.client import IncompleteRead
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from abs_kids_player import oled_catalogue, oled_service
 from abs_kids_player.api import AudiobookshelfError
+from abs_kids_player.appliance_io import InputEvent
+from abs_kids_player.audio import VolumeState
+from abs_kids_player.bluetooth_audio import BluetoothActionResult
+from abs_kids_player.bluetooth_picker import SpeakerPicker
+from abs_kids_player.catalogue_settings import (
+    CATALOGUE_COMMAND,
+    LibraryOption,
+    catalogue_request_key,
+)
 from abs_kids_player.config import (
-    DEFAULT_SCREEN_SAVER_DIM_PERCENT,
     LIBRARY_SORT_AUTHOR,
-    SCREEN_SAVER_BOOKS,
-    SCREEN_SAVER_CLOCK,
     AppConfig,
     PodcastConfig,
 )
-from abs_kids_player.models import AudioTrack, Book, Chapter, PlaybackSession
-from abs_kids_player.player_state import load_player_state, save_last_playback
-from abs_kids_player.oled_service import (
-    BLUETOOTH_PAIRING_FRAME,
-    BLUETOOTH_POWER_FRAME,
-    BOOK_LOADING_FRAME,
-    BookLoadResult,
-    DEFAULT_SCREEN_SAVER_IDLE_SECONDS,
-    DEFAULT_UNMUTE_VOLUME_PERCENT,
-    SOFTWARE_UPDATE_FRAME,
-    ListeningSleepTimer,
-    bluetooth_pairing_frame,
-    bluetooth_result_frame,
-    bluetooth_scanning_frame,
-    book_load_result,
-    clock_screen_saver_text,
-    consume_screen_saver_wake_input,
-    drain_input_events,
-    frame_with_mute_indicator,
-    frame_with_status_indicators,
-    frame_for_boot_state,
-    frame_for_wifi_status,
-    home_frame_for_books,
-    handle_menu_command,
-    handle_oled_input_events,
-    handle_web_player_commands,
-    handle_input_events_with_fallback,
-    input_activity_seen,
-    load_library_books,
-    load_home_frame,
-    pause_and_publish_playback,
-    poll_playback_safely,
-    refresh_home_cache,
-    screen_saver_frame,
-    screen_saver_is_active,
-    screen_saver_words_for_mode,
-    scrolled_home_frame,
-    set_amp_shutdown,
-    should_return_to_active_session,
-    signal_boot_splash_handoff,
-    save_playback_state,
-    sorted_books_for_menu,
-    splash_frame,
-    start_book_load_worker,
-    unmute_for_audible_playback_commands,
-    web_status_for_playback,
-)
-from abs_kids_player.podcast import podcast_book
-from abs_kids_player.appliance_io import (
-    InputEvent,
-    Sh1122Display,
-    oled_safe_text,
-    scale_grayscale_value,
-    screen_saver_word_specs,
-)
-from abs_kids_player.audio import AudioError, VolumeState
-from abs_kids_player.bluetooth_audio import BluetoothActionResult
-from abs_kids_player.playback import PlaybackError
-from abs_kids_player.player_control import load_web_player_status, queue_web_player_command
-from abs_kids_player.rotary_ui import (
-    ApplianceMenu,
-    BluetoothDevicesFrame,
-    BluetoothMenuFrame,
-    MenuCommand,
-    CommandType,
+from abs_kids_player.display_frames import (
+    SCREEN_OFF,
     HomeFrame,
     PlayingFrame,
-    ResumeChoiceFrame,
     ScreenSaverFrame,
+    SleepConfirmFrame,
     SplashFrame,
+    StartupResumeFrame,
     TwoLineFrame,
     VolumeFrame,
     WifiSetupFrame,
 )
+from abs_kids_player.listening_timer import ListeningSleepTimer
+from abs_kids_player.models import AudioTrack, Book, Chapter, PlaybackSession
+from abs_kids_player.oled_catalogue import BookLoadResult, book_load_result, start_book_load_worker
+from abs_kids_player.oled_input import OledInputQueue
+from abs_kids_player.oled_service import (
+    BLUETOOTH_POWER_FRAME,
+    BOOK_LOADING_FRAME,
+    SOFTWARE_UPDATE_FRAME,
+    apply_sleep_timer_event,
+    bluetooth_result_frame,
+    frame_for_boot_state,
+    frame_for_wifi_status,
+    frame_with_mute_indicator,
+    frame_with_status_indicators,
+    handle_menu_command,
+    handle_web_player_commands,
+    home_frame_for_books,
+    load_home_frame,
+    poll_playback_safely,
+    refresh_home_cache,
+    save_playback_state,
+    scrolled_home_frame,
+    set_amp_shutdown,
+    should_return_to_active_session,
+    signal_boot_splash_handoff,
+    splash_frame,
+    unmute_for_audible_playback_commands,
+    update_display_brightness,
+    web_status_for_playback,
+)
+from abs_kids_player.oled_web_status import WebStatusPublisher
+from abs_kids_player.playback import GStreamerPlayback, PlaybackError
+from abs_kids_player.playback_owner import PlaybackOwner, PlaybackSnapshot, PlaybackStartResult
+from abs_kids_player.player_control import (
+    WebPlayerCommand,
+    WebPlayerStatus,
+    load_web_player_status,
+    queue_web_player_command,
+)
+from abs_kids_player.player_state import LastPlaybackState, load_player_state, save_last_playback
+from abs_kids_player.podcast import podcast_book
+from abs_kids_player.rotary_ui import ApplianceMenu, CommandType, MenuCommand, Screen
+from abs_kids_player.volume_controls import DEFAULT_UNMUTE_VOLUME_PERCENT
 from abs_kids_player.wifi import SETUP_HOTSPOT_SSID, SETUP_HOTSPOT_URL, WifiStatus
 
 
@@ -130,6 +124,12 @@ class FakeAmpShutdown:
 
 
 class FakePlayback:
+    opening_key = ""
+    starting_book = False
+    audio_output_device = ""
+    volume_output = "speaker"
+    output_volumes = None
+
     def __init__(self, session: PlaybackSession | None = None) -> None:
         self.session = session
         self.current_time = 0.0
@@ -141,22 +141,32 @@ class FakePlayback:
         self.audio_refresh_calls = 0
         self.volume_states: list[tuple[int, bool]] = []
 
-    def start(self, _session, _client) -> None:
-        raise AssertionError("Existing active sessions should not be restarted.")
+    @property
+    def state(self) -> PlaybackSnapshot:
+        return PlaybackSnapshot(self.session, self.current_time, self.is_playing)
+
+    def cancel_book_request(self) -> None:
+        pass
 
     def seek_global(self, seek_time: float) -> None:
         self.current_time = seek_time
         self.seek_times.append(seek_time)
 
-    def resume(self, sync: bool = False, percent: int | None = None, muted: bool | None = None) -> None:
+    def resume(self, sync: bool = False, percent: int | None = None, muted: bool | None = None) -> bool:
+        if self.session is None or self.is_playing:
+            return False
         self.is_playing = True
         self.resume_calls += 1
         if percent is not None and muted is not None:
             self.volume_states.append((percent, muted))
+        return True
 
-    def pause(self, sync: bool = True) -> None:
+    def pause(self, sync: bool = True) -> bool:
+        if not self.is_playing:
+            return False
         self.is_playing = False
         self.pause_calls += 1
+        return True
 
     def stop(self) -> None:
         self.session = None
@@ -176,18 +186,31 @@ class FakePollingErrorPlayback:
         raise PlaybackError("GStreamer playback error.")
 
 
-class FakeStartingPlayback:
+class FakeStartingPlayback(FakePlayback):
+    progress_sync = None
     def __init__(self) -> None:
-        self.session = None
-        self.current_time = 0.0
-        self.is_playing = False
+        super().__init__()
         self.started_sessions: list[PlaybackSession] = []
+        self.start_over_flags: list[bool] = []
 
-    def start(self, session, _client) -> None:
+    def start(self, session, _client, *, start_over, cancelled, timing=None) -> None:
         self.session = session
         self.current_time = session.current_time
         self.is_playing = True
         self.started_sessions.append(session)
+        self.start_over_flags.append(start_over)
+        if timing is not None:
+            timing.observe_output("output_observed", rendered_at=timing.clock())
+
+
+def wait_for_playback_start(playback: PlaybackOwner) -> PlaybackStartResult:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        result = playback.advance_book_request()
+        if result is not None:
+            return result
+        time.sleep(0.001)
+    raise AssertionError("Playback start did not finish")
 
 
 class FakePlaybackClient:
@@ -218,41 +241,687 @@ def make_playback_session() -> PlaybackSession:
 
 
 class OledServiceTest(unittest.TestCase):
-    def test_home_jump_letter_uses_its_own_larger_font_without_moving_content(self) -> None:
-        display = object.__new__(Sh1122Display)
-        display.draw = Mock()
-        display.font_home_title = object()
-        display.font_home_author = object()
-        display.font_section_letter = object()
-        display.draw_centered_text = Mock()
-        display.draw_scrolling_text = Mock()
-        display.draw_bottom_left_text = Mock()
-        display.draw_bottom_right_text = Mock()
+    def test_physical_turn_is_reported_after_the_volume_frame_is_written(self):
+        events, display = OledInputQueue(), Mock()
+        events.put(InputEvent("volume", 1))
+        display.show.return_value = True
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "capture"
+            marker.touch()
+            with (patch("abs_kids_player.dial_timing.CAPTURE_MARKER", marker),
+                  patch("builtins.print") as messages):
+                self.run_service(display, events, AppConfig(),
+                                 lambda shutdown, seconds: shutdown.request(0, None) if seconds else None,
+                                 wifi_status=lambda: WifiStatus(False), load_saved_volume=lambda: VolumeState(3))
+        self.assertTrue(any(str(call.args[0]).startswith("Dial timing dial=volume turns=1 frame=VolumeFrame ")
+                            for call in messages.call_args_list if call.args))
+        display.show.assert_any_call(VolumeFrame(4))
 
+    def test_volume_turn_draws_while_the_periodic_shelf_scan_is_blocked(self):
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        def slow_scan(config):
+            started.set()
+            release.wait(3)
+            finished.set()
+            return []
+
+        display, events = Mock(), OledInputQueue()
+        events.put(InputEvent("volume", 1))
+        observed = []
+        def after_frame(shutdown, seconds):
+            if seconds > 0:
+                observed.append((display.show.call_args.args[0], started.wait(1), finished.is_set()))
+                release.set()
+                shutdown.request(0, None)
+
+        with (patch.object(oled_service, "DEFAULT_RUNTIME_CONFIG_REFRESH_SECONDS", 0),
+              patch("abs_kids_player.oled_shelf.account_downloads", slow_scan)):
+            self.run_service(display, events, AppConfig(), after_frame,
+                             wifi_status=lambda: WifiStatus(False), load_saved_volume=lambda: VolumeState(3))
+        self.assertEqual(observed, [(VolumeFrame(4), True, False)])
+        self.assertTrue(finished.is_set())
+
+    def test_streaming_resume_prompt_survives_waiting_for_the_first_wifi_check(self):
+        display = Mock()
+        frames = []
+        downloads = [Book("local", "Downloaded story", "", 60, "", downloaded=True)]
+        network = Mock()
+        network.current.side_effect = [None, WifiStatus(True, ssid="home")]
+
+        def after_frame(shutdown, seconds):
+            if seconds > 0:
+                frames.append(display.show.call_args.args[0])
+                if len(frames) == 2:
+                    shutdown.request(0, None)
+
+        self.run_service(display, OledInputQueue(), AppConfig(), after_frame,
+                         DeviceStatusCache=Mock(return_value=network),
+                         books_with_downloads=Mock(return_value=downloads),
+                         load_player_state=Mock(return_value=LastPlaybackState("stream", "Streamed story", current_time=30)))
+        self.assertTrue(all(isinstance(frame, StartupResumeFrame) and frame.title == "Streamed story" for frame in frames))
+
+    def test_volume_dial_updates_the_screen_while_networkmanager_is_still_busy(self):
+        started, release, completed = threading.Event(), threading.Event(), threading.Event()
+        def busy_probe():
+            started.set()
+            release.wait(timeout=3)
+            completed.set()
+            return WifiStatus(connected=True, ssid="home")
+
+        display, events = Mock(), OledInputQueue()
+        events.put(InputEvent("volume", 1))
+        frames = []
+        def after_frame(shutdown, seconds):
+            if seconds > 0:
+                frames.append((display.show.call_args.args[0], started.wait(timeout=1), completed.is_set()))
+                shutdown.request(0, None)
+        try:
+            self.run_service(display, events, AppConfig(), after_frame, DeviceStatusCache=oled_service.DeviceStatusCache,
+                             wifi_status=busy_probe, load_saved_volume=Mock(return_value=VolumeState(3)))
+        finally:
+            release.set()
+        self.assertEqual(frames, [(VolumeFrame(4), True, False)])
+        self.assertTrue(completed.wait(timeout=1))
+
+    def test_catalogue_refresh_keeps_the_selection_when_it_succeeds_or_fails(self) -> None:
+        config = AppConfig(server_url="https://books.example.test", token="token", library_id="first")
+        selected = Book("selected", "Selected", "", 60, "")
+        books = [Book("before", "Before", "", 60, ""), selected]
+        command = WebPlayerCommand(CATALOGUE_COMMAND, id="refresh", catalogue_key=catalogue_request_key(config))
+        for successful in (True, False):
+            with self.subTest(successful=successful):
+                display, events = Mock(), OledInputQueue()
+                events.put(InputEvent("nav", steps=1))
+                receipts, report, cache = Mock(), Mock(), Mock()
+
+                def start(_config, results, *, generation, library_id="") -> None:
+                    if successful:
+                        results.put(BookLoadResult(
+                            books=[Book("new", "A new book", "", 60, ""), *books], generation=generation
+                        ))
+                    else:
+                        results.put(BookLoadResult(
+                            error_frame=TwoLineFrame("Server unreachable", "Press to retry"), generation=generation
+                        ))
+
+                def finish(shutdown, seconds) -> None:
+                    if seconds > 0:
+                        shutdown.request(0, None)
+
+                self.run_service(
+                    display, events, config, finish,
+                    load_cached_books=Mock(return_value=books),
+                    wifi_status=Mock(return_value=WifiStatus(connected=successful, ssid="home" if successful else "")),
+                    consume_web_player_commands=Mock(return_value=[command]),
+                    start_book_load_worker=Mock(side_effect=start),
+                    save_cached_books=cache, report_catalogue_result=report, save_command_result=receipts,
+                )
+
+                self.assertEqual(display.show.call_args.args[0].title, "Selected")
+                receipts.assert_called_once_with(command, "applied" if successful else "rejected")
+                if successful:
+                    self.assertEqual(cache.call_args.args[1][0].id, "new")
+                    report.assert_called_once_with(config)
+                else:
+                    cache.assert_not_called()
+                    report.assert_called_once_with(config, "Server unreachable")
+
+    def test_newer_library_selection_prevents_an_older_result_from_saving(self) -> None:
+        config = AppConfig(server_url="https://books.example.test", token="token", library_id="first")
+        key = catalogue_request_key(config)
+        earlier = WebPlayerCommand(CATALOGUE_COMMAND, id="earlier", catalogue_key=key, library_id="earlier")
+        latest = WebPlayerCommand(CATALOGUE_COMMAND, id="latest", catalogue_key=key, library_id="latest")
+        display, events = Mock(), OledInputQueue()
+        def transaction(change):
+            return config, change(config)
+
+        saved, cache, receipts = Mock(side_effect=transaction), Mock(), Mock()
+        generations = {}
+
+        def start(_config, results, *, generation, library_id="") -> None:
+            generations[library_id] = generation
+            if library_id == "latest":
+                for target in ("earlier", "latest"):
+                    results.put(BookLoadResult(
+                        books=[Book(target, target.title(), "", 60, "")],
+                        generation=generations[target], library=LibraryOption(target, target.title()),
+                    ))
+
+        def finish(shutdown, seconds) -> None:
+            if seconds > 0 and (receipts.call_count >= 2 or display.show.call_count >= 6):
+                shutdown.request(0, None)
+
+        self.run_service(
+            display, events, config, finish,
+            consume_web_player_commands=Mock(side_effect=[[earlier], [latest], [], [], []]),
+            start_book_load_worker=Mock(side_effect=start),
+            update_config=saved, save_cached_books=cache, save_command_result=receipts,
+            wifi_status=Mock(return_value=WifiStatus(connected=True, ssid="home")),
+        )
+
+        self.assertEqual(saved.call_count, 1)
+        self.assertEqual(cache.call_args.args[0].library_id, "latest")
+        self.assertEqual(cache.call_args.args[1][0].id, "latest")
+        self.assertEqual([call.args for call in receipts.call_args_list],
+                         [(earlier, "superseded"), (latest, "applied")])
+
+    def test_startup_retries_unreadable_settings_after_showing_recovery_message(self):
+        from abs_kids_player.config import ConfigReadError
+
+        config = AppConfig()
+        display = Mock()
+        loader = Mock(side_effect=[ConfigReadError("settings"), config] + [config] * 10)
+
+        def finish(shutdown, seconds):
+            if loader.call_count > 1:
+                shutdown.request(0, None)
+
+        self.run_service(display, OledInputQueue(), config, finish, load_config=loader)
+        display.show.assert_any_call(TwoLineFrame("Settings unreadable", "Check config.json"))
+        self.assertGreaterEqual(loader.call_count, 2)
+
+    def test_navigation_click_retries_a_failed_library_load(self) -> None:
+        display = Mock()
+        events = OledInputQueue()
+        loads = [
+            BookLoadResult(error_frame=TwoLineFrame("Server unreachable", "Press to retry")),
+            BookLoadResult(books=[Book("book-1", "The Hobbit", "J.R.R. Tolkien", 1, "")]),
+        ]
+        config = AppConfig(server_url="https://books.example.com", token="token", library_id="library-1")
+
+        def run_book_load(_config, results, *, generation, **_options) -> None:
+            result = loads.pop(0)
+            result.generation = generation
+            results.put(result)
+
+        def after_frame(shutdown, seconds) -> None:
+            if seconds <= 0:
+                return
+            frame = display.show.call_args.args[0]
+            if frame == TwoLineFrame("Server unreachable", "Press to retry"):
+                events.put(InputEvent("nav_click"))
+            if isinstance(frame, HomeFrame) or display.show.call_count >= 8:
+                shutdown.request(0, None)
+
+        self.run_service(
+            display,
+            events,
+            config,
+            after_frame,
+            start_book_load_worker=Mock(side_effect=run_book_load),
+            wifi_status=Mock(return_value=WifiStatus(connected=True, ssid="home")),
+        )
+
+        display.show.assert_any_call(TwoLineFrame("Server unreachable", "Press to retry"))
+        self.assertEqual(display.show.call_args.args[0].title, "The Hobbit")
+        self.assertFalse(loads)
+
+    def test_failed_podcast_lookup_can_be_reopened_with_the_knob(self):
+        display, events = Mock(), OledInputQueue()
+        failed, recovered = Future(), Future()
+        failed.set_exception(IncompleteRead(b""))
+        recovered.set_result([Book("show/episode", "Episode", "", 100, "", episode_id="episode",
+                                   source_item_id="show", podcast_title="Test show")])
+        request = Mock(side_effect=[failed, recovered])
+        for event in (InputEvent("nav", -1), InputEvent("nav_click"), InputEvent("nav", 3), InputEvent("nav_click")):
+            events.put(event)
+        frames = []
+        def after_draw(shutdown, seconds):
+            if seconds <= 0:
+                return
+            frame = display.show.call_args.args[0]
+            frames.append(frame)
+            if frame.top == "Podcasts unavailable":
+                events.put(InputEvent("nav_click"))  # Back from the empty list
+                events.put(InputEvent("nav_click"))  # Reopen Podcasts
+            if frame.bottom == "Test show" or len(frames) >= 5:
+                shutdown.request(0, None)
+
+        self.run_service(display, events, AppConfig(), after_draw, request_podcast_catalogue=request,
+                         load_cached_books=Mock(return_value=[Book("book", "A book", "", 100, "")]),
+                         wifi_status=Mock(return_value=WifiStatus(connected=True, ssid="home")))
+        self.assertEqual(frames, [TwoLineFrame("Podcasts unavailable", "Open Podcasts to retry"),
+                                  TwoLineFrame("Podcasts", "Test show")])
+        self.assertEqual(request.call_count, 2)
+
+    def test_web_state_storage_failure_leaves_the_next_volume_turn_usable(self):
+        display, events = Mock(), OledInputQueue()
+        events.put(InputEvent("volume", 1))
+        writes = Mock(side_effect=OSError("state storage unavailable"))
+        commands = Mock(side_effect=OSError("command storage unavailable"))
+        frames = []
+        def after_draw(shutdown, seconds):
+            if seconds > 0:
+                frames.append(display.show.call_args.args[0])
+                if len(frames) == 1:
+                    events.put(InputEvent("volume", 1))
+                else:
+                    shutdown.request(0, None)
+
+        self.run_service(display, events, AppConfig(), after_draw, save_web_player_status=writes,
+                         consume_web_player_commands=commands, load_saved_volume=Mock(return_value=VolumeState(3)),
+                         wifi_status=Mock(return_value=WifiStatus(connected=False)))
+        self.assertEqual(frames, [VolumeFrame(percent=4), VolumeFrame(percent=5)])
+        self.assertEqual(writes.call_count, 1)
+        commands.assert_called_once_with()
+
+    def test_status_publication_recovers_with_the_latest_volume_and_display_timestamp(self):
+        playback = FakePlayback(make_playback_session())
+        write = Mock(side_effect=[PermissionError("status unavailable"), None])
+        publisher = WebStatusPublisher(write)
+        with patch("abs_kids_player.oled_web_status.time.monotonic", side_effect=[10, 11, 15]):
+            publisher.publish(playback, 3, False)
+            publisher.publish(playback, 4, False)
+            publisher.publish(playback, 5, False, display_drawn=True)
+        first, latest = [call.args[0] for call in write.call_args_list]
+        self.assertEqual((first.volume_percent, latest.volume_percent), (3, 5))
+        self.assertGreater(latest.display_drawn_at, 0)
+
+    def test_quiet_volume_is_restored_and_mute_works_with_spoken_navigation_disabled(self) -> None:
+        display = Mock()
+        events = OledInputQueue()
+        events.put(InputEvent("volume_click"))
+        saved_status = Mock()
+
+        def stop_after_input(shutdown, seconds) -> None:
+            if seconds > 0:
+                shutdown.request(0, None)
+
+        self.run_service(
+            display,
+            events,
+            AppConfig(spoken_navigation_enabled=False),
+            stop_after_input,
+            load_web_player_status=Mock(return_value=WebPlayerStatus(volume_percent=3)),
+            save_web_player_status=saved_status,
+            wifi_status=Mock(return_value=WifiStatus(connected=False)),
+        )
+
+        display.show.assert_any_call(VolumeFrame(percent=3, muted=True))
+        self.assertEqual(saved_status.call_args.args[0].volume_percent, 3)
+        self.assertTrue(saved_status.call_args.args[0].muted)
+
+    def test_playback_is_polled_during_a_volume_overlay_without_wifi(self) -> None:
+        display = Mock()
+        events = OledInputQueue()
+        events.put(InputEvent("volume", steps=1))
+        poll = Mock(return_value=None)
+
+        def stop_after_frame(shutdown, seconds) -> None:
+            if seconds > 0:
+                self.assertIsInstance(display.show.call_args.args[0], VolumeFrame)
+                poll.assert_called_once()
+                shutdown.request(0, None)
+
+        self.run_service(
+            display,
+            events,
+            AppConfig(spoken_navigation_enabled=False),
+            stop_after_frame,
+            poll_playback_safely=poll,
+            wifi_status=Mock(return_value=WifiStatus(connected=False)),
+        )
+
+    def test_service_starts_a_book_and_opens_more_without_squeezing_the_player_controls(self) -> None:
+        display = Mock()
+        events = OledInputQueue()
+        engine = GStreamerPlayback()
+        config = AppConfig(server_url="https://books.example.com", token="token", library_id="library-1")
+        book = Book("book-1", "The Hobbit", "J.R.R. Tolkien", 300, "")
+
+        def start(session, _client, *, start_over, cancelled, timing) -> None:
+            engine.session = session
+            engine.current_time = session.current_time
+            engine.is_playing = True
+            timing.observe_output("output_observed", rendered_at=timing.clock())
+
+        engine.start = Mock(side_effect=start)
+        frames = []
+        main_player = None
+        more_button = None
+        more_menu = None
+
+        def after_frame(shutdown, seconds) -> None:
+            nonlocal main_player, more_button, more_menu
+            if seconds <= 0:
+                return
+            frame = display.show.call_args.args[0]
+            first_frame = not frames
+            frames.append(frame)
+            if first_frame and isinstance(frame, HomeFrame):
+                events.put(InputEvent("nav_click"))
+                events.put(InputEvent("nav_click"))
+            elif isinstance(frame, PlayingFrame) and main_player is None:
+                main_player = frame
+                events.put(InputEvent("nav", steps=2))
+            elif isinstance(frame, PlayingFrame) and frame.selected_index == 4 and more_button is None:
+                more_button = frame
+                events.put(InputEvent("nav_click"))
+            elif isinstance(frame, TwoLineFrame) and frame.top == "More":
+                more_menu = frame
+                shutdown.request(0, None)
+            if len(frames) > 100 or frame.top == "OLED error":
+                shutdown.request(0, None)
+            time.sleep(0.001)
+
+        save = Mock(side_effect=PermissionError("Playback state is read-only"))
+        record_timing = Mock()
         with (
-            patch("abs_kids_player.appliance_io.text_width", return_value=20),
-            patch("abs_kids_player.appliance_io.fit_text", side_effect=lambda _draw, text, _font, _width: text),
+            patch("abs_kids_player.playback_start.load_config", return_value=config),
+            patch("abs_kids_player.playback_start.AudiobookshelfClient", FakePlaybackClient),
         ):
-            display.draw_home(HomeFrame("Matilda", "By Roald Dahl", section_letter="M", section_letter_fill=200))
+            self.run_service(
+                display, events, config, after_frame,
+                GStreamerPlayback=Mock(return_value=engine),
+                load_cached_books=Mock(return_value=[book]),
+                start_book_load_worker=Mock(),
+                wifi_status=Mock(return_value=WifiStatus(connected=True, ssid="home")),
+                save_last_playback=save,
+                record_startup_sample=record_timing,
+            )
 
-        self.assertEqual(display.draw_centered_text.call_args_list[0].kwargs["y"], 12)
-        self.assertEqual(display.draw_centered_text.call_args_list[1].kwargs["y"], 34)
-        display.draw_bottom_right_text.assert_called_once_with(
-            "M",
-            display.font_section_letter,
-            fill=200,
-            margin=3,
+        save.assert_called_once()
+        self.assertEqual(record_timing.call_count, 1)
+        sample = record_timing.call_args.args[0]
+        self.assertEqual((sample.source, sample.outcome), ("audiobookshelf", "output_observed"))
+        self.assertNotIn("OLED error", [frame.top for frame in frames])
+        self.assertEqual(main_player.actions, ("Home", "Prev", "Pause", "Next", "..."))
+        self.assertEqual(more_button.actions, main_player.actions)
+        self.assertEqual(more_button.chapter_text, main_player.chapter_text)
+        self.assertEqual(more_menu, TwoLineFrame("More", "Back"))
+
+    def test_quiet_volume_is_saved_before_the_volume_overlay_dismisses(self) -> None:
+        display = Mock()
+        events = OledInputQueue()
+        events.put(InputEvent("volume", steps=1))
+        saved_status = Mock()
+
+        def stop_after_input(shutdown, seconds) -> None:
+            if seconds > 0:
+                shutdown.request(0, None)
+
+        self.run_service(
+            display,
+            events,
+            AppConfig(),
+            stop_after_input,
+            load_web_player_status=Mock(return_value=WebPlayerStatus(volume_percent=2)),
+            save_web_player_status=saved_status,
+            wifi_status=Mock(return_value=WifiStatus(connected=False)),
         )
 
-    def test_oled_text_uses_ascii_apostrophes(self) -> None:
-        self.assertEqual(oled_safe_text("Charlotte\u2019s Web"), "Charlotte's Web")
-        self.assertEqual(oled_safe_text("Dragon\ufffds Promise"), "Dragon's Promise")
+        display.show.assert_any_call(VolumeFrame(percent=3))
+        self.assertEqual(saved_status.call_args.args[0].volume_percent, 3)
 
-    def test_oled_text_normalizes_other_typographic_punctuation(self) -> None:
-        self.assertEqual(
-            oled_safe_text("\u201cHello\u201d\u00a0\u2014 wait\u2026"),
-            '"Hello" - wait...',
+    def test_new_service_instances_restore_quiet_zero_and_muted_volume_from_disk(self) -> None:
+        def stop_after_frame(shutdown, seconds) -> None:
+            if seconds > 0:
+                shutdown.request(0, None)
+
+        for initial, event, expected in (
+            (4, InputEvent("volume", steps=-1), VolumeState(3)),
+            (1, InputEvent("volume", steps=-1), VolumeState(0)),
+            (3, InputEvent("volume_click"), VolumeState(3, muted=True)),
+        ):
+            with self.subTest(volume=expected), tempfile.TemporaryDirectory() as directory:
+                volume_file = str(Path(directory) / "player-state.json")
+                with patch.dict("os.environ", {"ABS_KIDS_PLAYER_STATE_PATH": volume_file}):
+                    events = OledInputQueue()
+                    events.put(event)
+                    self.run_service(
+                        Mock(), events, AppConfig(), stop_after_frame,
+                        load_saved_volume=oled_service.load_saved_volume,
+                        save_output_volumes=oled_service.save_output_volumes,
+                        load_web_player_status=Mock(return_value=WebPlayerStatus(volume_percent=initial)),
+                        wifi_status=Mock(return_value=WifiStatus(connected=False)),
+                    )
+
+                    status = Mock()
+                    stale_status = Mock(return_value=WebPlayerStatus(volume_percent=50))
+                    chime = Mock()
+                    self.run_service(
+                        Mock(), OledInputQueue(), AppConfig(), stop_after_frame,
+                        load_saved_volume=oled_service.load_saved_volume,
+                        save_output_volumes=oled_service.save_output_volumes,
+                        load_web_player_status=stale_status,
+                        save_web_player_status=status,
+                        play_boot_chime=chime,
+                        wifi_status=Mock(return_value=WifiStatus(connected=False)),
+                    )
+                    stale_status.assert_not_called()
+                    self.assertEqual(status.call_args.args[0].volume_percent, expected.percent)
+                    self.assertEqual(status.call_args.args[0].muted, expected.muted or expected.percent == 0)
+                    if expected.muted or expected.percent == 0:
+                        chime.assert_not_called()
+                    else:
+                        chime.assert_called_once_with(expected.percent)
+
+    def test_screen_saver_uses_lower_panel_contrast_and_restores_it_on_wake(self) -> None:
+        display = Mock()
+
+        def stop_after_two_frames(shutdown, seconds) -> None:
+            if seconds > 0 and display.set_brightness.call_count == 2:
+                shutdown.request(0, None)
+            if display.show.call_count > 6:
+                shutdown.request(0, None)
+
+        self.run_service(
+            display, OledInputQueue(), AppConfig(screen_saver_dim_percent=5), stop_after_two_frames,
+            screen_saver_is_active=Mock(side_effect=[True, False]),
+            wifi_status=Mock(return_value=WifiStatus(connected=False)),
         )
+
+        self.assertEqual([call.args[0] for call in display.set_brightness.call_args_list], [73, 100])
+        frames = [call.args[0] for call in display.show.call_args_list]
+        saver = next(frame for frame in frames if isinstance(frame, ScreenSaverFrame))
+        self.assertEqual(saver.brightness_percent, 5)
+
+    def test_brightness_change_is_retried_after_a_failed_transfer(self) -> None:
+        display = Mock()
+        display.set_brightness.side_effect = [OSError("SPI unavailable"), None]
+
+        current = update_display_brightness(display, 73, 100)
+        self.assertEqual(current, 100)
+        self.assertEqual(update_display_brightness(display, 73, current), 73)
+
+    def test_idle_screen_off_keeps_web_volume_playback_and_display_heartbeat_working(self):
+        clock = Mock(wraps=time)
+        clock.monotonic.return_value = 1000
+        display, events, status = Mock(), OledInputQueue(), Mock()
+        engine = GStreamerPlayback()
+        engine.session = make_playback_session()
+        engine.is_playing = True
+        engine.poll = Mock()
+        commands = []
+        frames = []
+        levels = []
+
+        def next_frame(shutdown, seconds):
+            if seconds <= 0:
+                return
+            frames.append(display.show.call_args.args[0])
+            live = status.call_args.args[0]
+            levels.append(live.volume_percent)
+            self.assertTrue(live.is_playing)
+            self.assertGreater(live.display_drawn_at, 0)
+            if len(frames) == 1:
+                clock.monotonic.return_value += 61
+            elif len(frames) == 2:
+                commands.append(WebPlayerCommand("volume", value=31))
+            elif len(frames) == 3:
+                events.put(InputEvent("volume_click", received_at=1061))
+            else:
+                shutdown.request(0, None)
+
+        def read_commands():
+            batch = commands.copy()
+            commands.clear()
+            return batch
+
+        self.run_service(
+            display, events, AppConfig(screen_off_minutes=1), next_frame, time=clock,
+            wifi_status=Mock(return_value=WifiStatus(connected=False)),
+            GStreamerPlayback=Mock(return_value=engine), consume_web_player_commands=read_commands,
+            save_web_player_status=status, save_playback_state=Mock(), ListeningDetailsPublisher=Mock(),
+        )
+        self.assertNotEqual(frames[0], SCREEN_OFF)
+        self.assertEqual(frames[1:3], [SCREEN_OFF, SCREEN_OFF])
+        self.assertNotEqual(frames[3], SCREEN_OFF)
+        self.assertEqual(levels[-2:], [31, 31])
+        self.assertFalse(status.call_args.args[0].muted)
+        engine.poll.assert_called()
+
+    def test_boot_during_screen_off_hours_wakes_on_first_input_and_sleeps_again(self):
+        clock, local_clock = Mock(wraps=time), Mock()
+        clock.monotonic.return_value = 500
+        local_clock.now.return_value = datetime(2026, 11, 25, 1)
+        display, events, frames = Mock(), OledInputQueue(), []
+
+        def next_frame(shutdown, seconds):
+            frames.append(display.show.call_args.args[0])
+            if len(frames) == 2:
+                events.put(InputEvent("volume", 1, received_at=500))
+            elif len(frames) == 3:
+                clock.monotonic.return_value += 61
+            elif len(frames) == 4:
+                local_clock.now.return_value = datetime(2026, 11, 25, 7)
+            elif len(frames) == 5:
+                shutdown.request(0, None)
+
+        self.run_service(display, events, AppConfig(screen_off_start="22:00", screen_off_end="07:00"),
+                         next_frame, time=clock, datetime=local_clock,
+                         wifi_status=Mock(return_value=WifiStatus(connected=False)))
+        self.assertEqual([frame == SCREEN_OFF for frame in frames], [True, True, False, True, False])
+        self.assertFalse(any(isinstance(frame, VolumeFrame) for frame in frames))
+
+    def test_spoken_navigation_and_clicks_use_their_own_level_at_zero_playback_volume(self) -> None:
+        events = OledInputQueue()
+        events.put(InputEvent("nav_click"))
+        speech = Mock()
+        click = Mock()
+
+        def stop_after_frame(shutdown, seconds) -> None:
+            if seconds > 0:
+                shutdown.request(0, None)
+
+        self.run_service(
+            Mock(),
+            events,
+            AppConfig(
+                spoken_navigation_enabled=True,
+                control_click_volume_percent=18,
+                spoken_navigation_volume_percent=42,
+            ),
+            stop_after_frame,
+            load_saved_volume=Mock(return_value=VolumeState(0)),
+            load_cached_books=Mock(return_value=[Book("book-1", "The Hobbit", "", 1, "")]),
+            SpokenNavigationFeedback=Mock(return_value=speech),
+            play_control_click=click,
+            wifi_status=Mock(return_value=WifiStatus(connected=False)),
+        )
+
+        click.assert_called_once_with(18)
+        self.assertEqual(speech.request.call_args.kwargs["volume_percent"], 42)
+        self.assertFalse(speech.request.call_args.kwargs.get("muted", False))
+
+    def test_shutdown_during_discovery_closes_display_even_if_playback_stop_fails(self):
+        scanning, released = threading.Event(), threading.Event()
+
+        def discover(publish, cancel):
+            scanning.set()
+            if cancel.wait(2):
+                released.set()
+
+        def make_menu(*args, **kwargs):
+            menu = ApplianceMenu(*args, **kwargs)
+            menu.speakers = SpeakerPicker(discover=discover)
+            menu.screen = Screen.BLUETOOTH_DEVICES
+            menu.speakers.open()
+            return menu
+
+        events = OledInputQueue()
+        display = Mock()
+        display.close.side_effect = lambda: self.assertTrue(released.is_set())
+        engine = GStreamerPlayback()
+        engine.stop = Mock(side_effect=OSError("audio shutdown failed"))
+
+        def stop_after_frame(shutdown, seconds):
+            if seconds > 0:
+                self.assertTrue(scanning.wait(1))
+                shutdown.request(0, None)
+
+        with self.assertRaisesRegex(OSError, "audio shutdown failed"):
+            self.run_service(display, events, AppConfig(), stop_after_frame,
+                             GStreamerPlayback=Mock(return_value=engine), ApplianceMenu=make_menu,
+                             wifi_status=Mock(return_value=WifiStatus(connected=False)))
+        engine.stop.assert_called_once_with()
+        display.close.assert_called_once_with()
+
+    def test_warmup_runs_once_after_the_first_non_splash_frame_is_drawn(self) -> None:
+        display, runtime = Mock(), Mock()
+        frames_at_warmup = []
+        runtime.start_warmup.side_effect = lambda: frames_at_warmup.extend(
+            call.args[0] for call in display.show.call_args_list
+        )
+
+        def stop_after_draws(shutdown, seconds):
+            if display.show.call_count >= 4:
+                shutdown.request(0, None)
+
+        self.run_service(
+            display, OledInputQueue(), AppConfig(), stop_after_draws,
+            GStreamerRuntime=Mock(return_value=runtime),
+            wifi_status=Mock(return_value=WifiStatus(connected=False)),
+        )
+        runtime.start_warmup.assert_called_once_with()
+        runtime.stop_preloading.assert_called_once_with()
+        self.assertIsInstance(frames_at_warmup[0], SplashFrame)
+        self.assertNotIsInstance(frames_at_warmup[-1], SplashFrame)
+        self.assertLess(len(frames_at_warmup), display.show.call_count)
+
+    def run_service(self, display, events, config, after_frame, **overrides) -> None:
+        catalogue_mocks = {name: overrides.pop(name, Mock()) for name in ("save_cached_books", "report_catalogue_result")}
+        for name in ("update_config", "start_book_load_worker"):
+            if name in overrides:
+                catalogue_mocks[name] = overrides.pop(name)
+        catalogue_mocks["load_config"] = overrides.get("load_config", Mock(return_value=config))
+        if "save_command_result" in overrides:
+            catalogue_mocks["save_command_result"] = overrides["save_command_result"]
+        mocks = {
+            "GStreamerRuntime": Mock(),
+            "OledInputQueue": Mock(return_value=events),
+            "enable_stack_dump_signal": Mock(),
+            "start_bluetooth_status_worker": Mock(),
+            "load_config": Mock(return_value=config),
+            "load_cached_books": Mock(return_value=[]),
+            "DeviceStatusCache": Mock(return_value=Mock(current=lambda probe: probe())),
+            "record_startup_sample": Mock(),
+            "load_player_state": Mock(return_value=None),
+            "load_bluetooth_volume": Mock(return_value=VolumeState(10)),
+            "load_saved_volume": Mock(return_value=None),
+            "save_output_volumes": Mock(),
+            "load_web_player_status": Mock(return_value=WebPlayerStatus()),
+            "save_web_player_status": Mock(),
+            "update_state_is_active": Mock(return_value=False),
+            "consume_web_player_commands": Mock(return_value=[]),
+            "play_boot_chime": Mock(),
+            "sleep_until_shutdown": Mock(side_effect=lambda shutdown, seconds, **_options: after_frame(shutdown, seconds)),
+            **overrides,
+        }
+        queues = SimpleNamespace(
+            SimpleQueue=Mock(side_effect=[queue.SimpleQueue(), queue.SimpleQueue()]),
+            Empty=queue.Empty,
+        )
+        with (
+            patch.object(oled_service.signal, "signal"),
+            patch.object(oled_service, "queue", queues),
+            patch.multiple(oled_catalogue, **catalogue_mocks),
+            patch.multiple(oled_service, **mocks),
+        ):
+            oled_service.run_oled_service(
+                display, splash_seconds=0, startup_network_grace_seconds=0,
+                nav_input_enabled=False, volume_input_enabled=False,
+            )
 
     def test_splash_frame_says_chapter(self) -> None:
         frame = splash_frame()
@@ -263,15 +932,6 @@ class OledServiceTest(unittest.TestCase):
     def test_software_update_frame_warns_against_powering_off(self) -> None:
         self.assertEqual(SOFTWARE_UPDATE_FRAME.top, "UPDATING")
         self.assertEqual(SOFTWARE_UPDATE_FRAME.bottom, "DO NOT POWER OFF")
-
-    def test_update_mode_discards_rotary_events(self) -> None:
-        events: queue.SimpleQueue[InputEvent] = queue.SimpleQueue()
-        events.put(InputEvent("nav", 1))
-        events.put(InputEvent("volume_click"))
-
-        drain_input_events(events)
-
-        self.assertTrue(events.empty())
 
     def test_signal_boot_splash_handoff_writes_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -326,6 +986,13 @@ class OledServiceTest(unittest.TestCase):
 
         self.assertIsInstance(frame, WifiSetupFrame)
 
+    def test_boot_state_keeps_the_cached_library_visible_without_wifi(self) -> None:
+        home = HomeFrame("The Hobbit", "J.R.R. Tolkien")
+
+        frame = frame_for_boot_state(WifiStatus(connected=False), home, startup_waiting=True)
+
+        self.assertEqual(frame, home)
+
     def test_boot_state_shows_active_setup_hotspot_during_network_grace(self) -> None:
         frame = frame_for_boot_state(
             WifiStatus(connected=True, ssid=SETUP_HOTSPOT_SSID),
@@ -369,63 +1036,6 @@ class OledServiceTest(unittest.TestCase):
         self.assertEqual([book.title for book in result.books], ["The Hobbit"])
         self.assertIsNone(result.error_frame)
 
-    def test_load_library_books_adds_configured_podcast_menu_item(self) -> None:
-        podcast = make_podcast_config()
-        books = load_library_books(
-            AppConfig(
-                server_url="https://books.example.com",
-                token="token",
-                library_id="library-1",
-                podcasts=[podcast],
-            ),
-            client_factory=FakeClient,
-        )
-
-        self.assertEqual(books[-1], podcast_book(podcast))
-
-    def test_sorted_books_for_menu_merges_podcasts_with_audiobooks(self) -> None:
-        books = sorted_books_for_menu(
-            [
-                Book(id="book-1", title="The Hobbit", author="J.R.R. Tolkien", duration=1, cover_url=""),
-                Book(id="podcast:yoto-daily", title="Yoto Daily", author="Yoto", duration=0, cover_url=""),
-                Book(id="book-2", title="A Bear Called Paddington", author="Michael Bond", duration=1, cover_url=""),
-                Book(id="podcast:trivia-for-kids", title="Trivia for Kids", author="KRCreative", duration=0, cover_url=""),
-            ]
-        )
-
-        self.assertEqual([book.title for book in books], [
-            "A Bear Called Paddington",
-            "The Hobbit",
-            "Trivia for Kids",
-            "Yoto Daily",
-        ])
-
-    def test_sorted_books_for_menu_uses_series_title(self) -> None:
-        books = sorted_books_for_menu(
-            [
-                Book(id="book-2", title="Book Two", author="Author", duration=1, cover_url="", series_name="Zebra Tales"),
-                Book(id="book-1", title="Matilda", author="Roald Dahl", duration=1, cover_url=""),
-            ]
-        )
-
-        self.assertEqual([book.display_title for book in books], ["Matilda", "Zebra Tales: Book Two"])
-
-    def test_sorted_books_for_menu_can_order_by_author_last_name(self) -> None:
-        books = sorted_books_for_menu(
-            [
-                Book(id="book-1", title="The Hobbit", author="J.R.R. Tolkien", duration=1, cover_url=""),
-                Book(id="book-2", title="Matilda", author="Roald Dahl", duration=1, cover_url=""),
-                Book(id="book-3", title="A Bear Called Paddington", author="Michael Bond", duration=1, cover_url=""),
-                Book(id="book-4", title="Mystery Book", author="", duration=1, cover_url=""),
-            ],
-            LIBRARY_SORT_AUTHOR,
-        )
-
-        self.assertEqual(
-            [book.title for book in books],
-            ["A Bear Called Paddington", "Matilda", "The Hobbit", "Mystery Book"],
-        )
-
     def test_book_load_result_turns_audiobookshelf_error_into_display_frame(self) -> None:
         result = book_load_result(
             AppConfig(server_url="https://books.example.com", token="token", library_id="library-1"),
@@ -435,6 +1045,7 @@ class OledServiceTest(unittest.TestCase):
         self.assertIsNone(result.books)
         self.assertIsInstance(result.error_frame, TwoLineFrame)
         self.assertEqual(result.error_frame.top, "Books unavailable")
+        self.assertEqual(result.error_frame.bottom, "Press to retry")
 
     def test_start_book_load_worker_queues_book_result(self) -> None:
         results: queue.SimpleQueue[BookLoadResult] = queue.SimpleQueue()
@@ -491,11 +1102,14 @@ class OledServiceTest(unittest.TestCase):
         playback.is_playing = True
         menu = ApplianceMenu([Book("book-1", "The Hobbit", "J.R.R. Tolkien", 300, "")])
         menu.set_session(session, is_playing=True)
+        timer = ListeningSleepTimer()
+        publisher = WebStatusPublisher(oled_service.save_web_player_status)
+        event = timer.update(60, 60, True, 1, session.id, True)
 
         with tempfile.TemporaryDirectory() as directory:
             status_path = str(Path(directory) / "status.json")
             with patch.dict("os.environ", {"ABS_KIDS_PLAYER_WEB_STATUS_PATH": status_path}):
-                pause_and_publish_playback(playback, menu, volume_percent=55, muted=False)
+                apply_sleep_timer_event(event, timer, 60, playback, menu, volume_percent=55, muted=False, publisher=publisher)
                 status = load_web_player_status()
 
         self.assertEqual(playback.pause_calls, 1)
@@ -503,6 +1117,14 @@ class OledServiceTest(unittest.TestCase):
         self.assertFalse(menu.is_playing)
         self.assertFalse(status.is_playing)
         self.assertEqual(status.current_time, 88)
+        self.assertEqual(menu.render(), SleepConfirmFrame(30))
+
+        event = timer.update(61, 1, False, 1, session.id, False)
+        apply_sleep_timer_event(event, timer, 61, playback, menu, volume_percent=55, muted=False, publisher=publisher)
+
+        self.assertEqual(playback.resume_calls, 1)
+        self.assertTrue(menu.is_playing)
+        self.assertIsInstance(menu.render(), PlayingFrame)
 
     def test_web_player_commands_pause_play_and_adjust_volume(self) -> None:
         menu = ApplianceMenu([Book("book-1", "The Hobbit", "J.R.R. Tolkien", 300, "")])
@@ -566,6 +1188,25 @@ class OledServiceTest(unittest.TestCase):
                 self.assertFalse(menu.books)
                 self.assertIsNone(load_player_state())
                 self.assertEqual((volume, muted), (50, False))
+
+    def test_manual_catalogue_command_leaves_playback_running(self) -> None:
+        book = Book("book-1", "The Hobbit", "", 300, "")
+        menu = ApplianceMenu([book])
+        session = make_playback_session()
+        playback = FakePlayback(session)
+        playback.is_playing = True
+        menu.set_session(session, is_playing=True)
+        request = Mock()
+        command = WebPlayerCommand(CATALOGUE_COMMAND, id="manual")
+        with patch("abs_kids_player.oled_service.consume_web_player_commands", return_value=[command]):
+            result = handle_web_player_commands(playback, menu, 40, False, request_catalogue=request)
+        request.assert_called_once_with(command)
+        self.assertEqual(result, (40, False, False, False))
+        self.assertIs(playback.session, session)
+        self.assertTrue(playback.is_playing)
+        self.assertEqual((playback.pause_calls, playback.stop_calls), (0, 0))
+        menu.set_books([])
+        self.assertIsInstance(menu.render(), PlayingFrame)
 
     def test_web_resort_library_command_keeps_playback_running(self) -> None:
         menu = ApplianceMenu(
@@ -658,150 +1299,6 @@ class OledServiceTest(unittest.TestCase):
         self.assertEqual(frame, new)
         self.assertEqual(loaded_at, 99.0)
 
-    def test_screen_saver_starts_after_five_idle_minutes(self) -> None:
-        last_input_at = 100.0
-
-        self.assertFalse(
-            screen_saver_is_active(
-                now=last_input_at + DEFAULT_SCREEN_SAVER_IDLE_SECONDS - 0.1,
-                last_input_at=last_input_at,
-                idle_seconds=DEFAULT_SCREEN_SAVER_IDLE_SECONDS,
-            )
-        )
-        self.assertTrue(
-            screen_saver_is_active(
-                now=last_input_at + DEFAULT_SCREEN_SAVER_IDLE_SECONDS,
-                last_input_at=last_input_at,
-                idle_seconds=DEFAULT_SCREEN_SAVER_IDLE_SECONDS,
-            )
-        )
-
-    def test_screen_saver_frame_advances_with_idle_time(self) -> None:
-        frame = screen_saver_frame(now=305.5, last_input_at=5.0, frames_per_second=8.0)
-
-        self.assertIsInstance(frame, ScreenSaverFrame)
-        self.assertEqual(frame.frame_index, 2404)
-        self.assertEqual(frame.mode, "chapter")
-        self.assertEqual(frame.words, ("chapter",))
-        self.assertEqual(frame.brightness_percent, DEFAULT_SCREEN_SAVER_DIM_PERCENT)
-
-    def test_screen_saver_frame_uses_configured_dim_level(self) -> None:
-        frame = screen_saver_frame(
-            now=305.5,
-            last_input_at=5.0,
-            brightness_percent=10,
-        )
-
-        self.assertEqual(frame.brightness_percent, 10)
-
-    def test_screen_saver_frame_can_use_book_titles(self) -> None:
-        frame = screen_saver_frame(
-            now=305.5,
-            last_input_at=5.0,
-            frames_per_second=8.0,
-            mode=SCREEN_SAVER_BOOKS,
-            words=("Matilda", "The Hobbit"),
-        )
-
-        self.assertEqual(frame.mode, SCREEN_SAVER_BOOKS)
-        self.assertEqual(frame.words, ("Matilda", "The Hobbit"))
-
-    def test_screen_saver_frame_can_use_clock(self) -> None:
-        frame = screen_saver_frame(
-            now=305.5,
-            last_input_at=5.0,
-            frames_per_second=8.0,
-            mode=SCREEN_SAVER_CLOCK,
-        )
-
-        self.assertEqual(frame.mode, SCREEN_SAVER_CLOCK)
-        self.assertRegex(frame.clock_text, r"^\d{1,2}:\d{2} [AP]M$")
-
-    def test_screen_saver_words_for_books_uses_library_titles(self) -> None:
-        books = [
-            Book(id="book-1", title="The Hobbit", author="J.R.R. Tolkien", duration=1, cover_url=""),
-            Book(
-                id="book-2",
-                title="The Wild Robot Escapes",
-                author="Peter Brown",
-                duration=1,
-                cover_url="",
-                series_name="The Wild Robot",
-            ),
-        ]
-
-        self.assertEqual(
-            screen_saver_words_for_mode(SCREEN_SAVER_BOOKS, books),
-            ("The Hobbit", "The Wild Robot: The Wild Robot Escapes"),
-        )
-        self.assertEqual(screen_saver_words_for_mode(SCREEN_SAVER_BOOKS, []), ("chapter",))
-
-    def test_clock_screen_saver_text_uses_am_pm(self) -> None:
-        from datetime import datetime
-
-        self.assertEqual(clock_screen_saver_text(datetime(2026, 6, 9, 7, 5)), "7:05 AM")
-        self.assertEqual(clock_screen_saver_text(datetime(2026, 6, 9, 19, 5)), "7:05 PM")
-
-    def test_screen_saver_word_specs_move_chapter_words(self) -> None:
-        first = screen_saver_word_specs(frame_index=10, width=256, height=64)
-        second = screen_saver_word_specs(frame_index=11, width=256, height=64)
-
-        self.assertEqual(len(first), 8)
-        self.assertEqual(first[0]["font_index"], 0)
-        self.assertNotEqual(first[0]["x"], second[0]["x"])
-        self.assertGreater(second[0]["x"], first[0]["x"])
-        self.assertGreater(second[1]["x"], first[1]["x"])
-        self.assertNotEqual(
-            first[0]["font_index"],
-            screen_saver_word_specs(frame_index=106, width=256, height=64)[0]["font_index"],
-        )
-
-    def test_screen_saver_is_disabled_with_zero_idle_seconds(self) -> None:
-        self.assertFalse(screen_saver_is_active(now=999.0, last_input_at=0.0, idle_seconds=0.0))
-
-    def test_listening_sleep_timer_counts_only_active_playback(self) -> None:
-        timer = ListeningSleepTimer()
-
-        self.assertEqual(timer.update(30, 30, True, 1, "session-1", True), "")
-        self.assertEqual(timer.update(50, 20, True, 1, "session-1", False), "")
-        self.assertEqual(timer.listened_seconds, 30)
-        self.assertEqual(timer.update(80, 30, True, 1, "session-1", True), "prompt")
-        self.assertEqual(timer.countdown_seconds(80), 30)
-
-    def test_listening_sleep_timer_counts_down_then_sleeps(self) -> None:
-        timer = ListeningSleepTimer()
-        timer.update(60, 60, True, 1, "session-1", True)
-
-        self.assertEqual(timer.update(89.1, 0, True, 1, "session-1", False), "")
-        self.assertEqual(timer.countdown_seconds(89.1), 1)
-        self.assertEqual(timer.update(90, 0, True, 1, "session-1", False), "sleep")
-        self.assertTrue(timer.sleeping)
-        self.assertEqual(timer.sleep_started_at, 90)
-
-    def test_listening_sleep_timer_confirm_and_wake_reset_interval(self) -> None:
-        timer = ListeningSleepTimer()
-        timer.update(60, 60, True, 1, "session-1", True)
-        timer.confirm()
-
-        self.assertFalse(timer.prompt_active)
-        self.assertEqual(timer.listened_seconds, 0)
-
-        timer.update(120, 60, True, 1, "session-1", True)
-        timer.update(150, 0, True, 1, "session-1", False)
-        self.assertTrue(timer.wake())
-        self.assertFalse(timer.sleeping)
-        self.assertEqual(timer.listened_seconds, 0)
-
-    def test_disabling_active_sleep_timer_cancels_prompt(self) -> None:
-        timer = ListeningSleepTimer()
-        timer.update(60, 60, True, 1, "session-1", True)
-
-        event = timer.update(61, 1, False, 1, "session-1", False)
-
-        self.assertEqual(event, "cancel")
-        self.assertFalse(timer.prompt_active)
-        self.assertFalse(timer.sleeping)
-
     def test_still_listening_confirmation_resumes_playback(self) -> None:
         menu = ApplianceMenu([Book("book-1", "The Hobbit", "J.R.R. Tolkien", 300, "")])
         session = make_playback_session()
@@ -820,110 +1317,6 @@ class OledServiceTest(unittest.TestCase):
         self.assertTrue(playback.is_playing)
         self.assertTrue(menu.is_playing)
 
-    def test_screen_saver_grayscale_is_scaled_to_selected_percent(self) -> None:
-        self.assertEqual(scale_grayscale_value(255, 10), 26)
-        self.assertEqual(scale_grayscale_value(180, 10), 18)
-        self.assertEqual(scale_grayscale_value(0, 10), 0)
-
-    def test_sh1122_brightness_uses_perceptual_contrast_curve(self) -> None:
-        display = object.__new__(Sh1122Display)
-        commands: list[list[int]] = []
-        display.command = commands.append
-
-        display.set_brightness(25)
-        display.set_brightness(50)
-        display.set_brightness(100)
-
-        self.assertEqual(commands, [[0x81, 0x06], [0x81, 0x1C], [0x81, 0x80]])
-
-    def test_input_activity_seen_wakes_screen_saver(self) -> None:
-        self.assertFalse(input_activity_seen(None, False, [], False))
-        self.assertTrue(input_activity_seen(VolumeFrame(50), False, [], False))
-        self.assertTrue(input_activity_seen(None, True, [], False))
-        self.assertTrue(input_activity_seen(None, False, [MenuCommand(CommandType.HOME)], False))
-        self.assertTrue(input_activity_seen(None, False, [], True))
-
-    def test_screen_saver_wake_consumes_all_pending_input(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("nav_click"))
-        events.put(InputEvent("nav", steps=1))
-
-        woke, quiet_until = consume_screen_saver_wake_input(
-            events,
-            screen_saver_visible=True,
-            now=100.0,
-            quiet_until=0.0,
-        )
-
-        self.assertTrue(woke)
-        self.assertAlmostEqual(quiet_until, 100.35)
-        self.assertTrue(events.empty())
-
-    def test_screen_saver_wake_quiet_period_absorbs_residual_events(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume", steps=1))
-
-        woke, quiet_until = consume_screen_saver_wake_input(
-            events,
-            screen_saver_visible=False,
-            now=100.2,
-            quiet_until=100.35,
-        )
-
-        self.assertFalse(woke)
-        self.assertAlmostEqual(quiet_until, 100.55)
-        self.assertTrue(events.empty())
-
-    def test_active_screen_does_not_consume_input(self) -> None:
-        events = queue.SimpleQueue()
-        event = InputEvent("nav_click")
-        events.put(event)
-
-        woke, quiet_until = consume_screen_saver_wake_input(
-            events,
-            screen_saver_visible=False,
-            now=101.0,
-            quiet_until=100.35,
-        )
-
-        self.assertFalse(woke)
-        self.assertEqual(quiet_until, 100.35)
-        self.assertEqual(events.get_nowait(), event)
-
-    def test_volume_event_falls_back_to_software_volume_when_audio_control_fails(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume", steps=1))
-
-        with patch("abs_kids_player.oled_service.change_volume", side_effect=AudioError("missing audio")):
-            frame, percent, muted = handle_input_events_with_fallback(
-                events,
-                fallback_percent=50,
-                fallback_muted=False,
-            )
-
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(frame.percent, 55)
-        self.assertEqual(percent, 55)
-        self.assertFalse(muted)
-
-    def test_volume_click_fallback_shows_muted_without_zeroing_percent(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume_click"))
-
-        with patch("abs_kids_player.oled_service.toggle_mute", side_effect=AudioError("missing audio")):
-            frame, percent, muted = handle_input_events_with_fallback(
-                events,
-                fallback_percent=50,
-                fallback_muted=False,
-            )
-
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(frame.percent, 50)
-        self.assertEqual(frame.top, "Muted")
-        self.assertTrue(frame.is_muted)
-        self.assertEqual(percent, 50)
-        self.assertTrue(muted)
-
     def test_mute_indicator_is_added_to_non_volume_frames_only(self) -> None:
         home = frame_with_mute_indicator(HomeFrame("Matilda", "Roald Dahl"), muted=True)
         volume_frame = VolumeFrame(50, muted=True)
@@ -940,12 +1333,12 @@ class OledServiceTest(unittest.TestCase):
         self.assertTrue(frame.bluetooth_connected)
         self.assertFalse(frame.muted)
 
-    def test_bluetooth_success_frame_says_paired_successfully(self) -> None:
+    def test_bluetooth_success_frame_reports_ready_speaker(self) -> None:
         frame = bluetooth_result_frame(
             BluetoothActionResult(True, "Bluetooth connected", enabled=True, device_name="Playroom Speaker")
         )
 
-        self.assertEqual(frame.top, "Paired Successfully!")
+        self.assertEqual(frame.top, "Speaker ready")
         self.assertEqual(frame.bottom, "Playroom Speaker")
 
     def test_bluetooth_unpair_frame_returns_to_internal_speaker(self) -> None:
@@ -959,7 +1352,7 @@ class OledServiceTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(frame.top, "Bluetooth unpaired")
+        self.assertEqual(frame.top, "Disconnected")
         self.assertEqual(frame.bottom, "Internal speaker")
 
     def test_amp_shutdown_tracks_muted_or_zero_volume(self) -> None:
@@ -968,8 +1361,9 @@ class OledServiceTest(unittest.TestCase):
         self.assertTrue(set_amp_shutdown(amp, muted=True, volume_percent=50))
         self.assertTrue(set_amp_shutdown(amp, muted=False, volume_percent=0))
         self.assertFalse(set_amp_shutdown(amp, muted=False, volume_percent=50))
+        self.assertFalse(set_amp_shutdown(amp, muted=True, volume_percent=0, feedback_active=True))
 
-        self.assertEqual(amp.states, [True, True, False])
+        self.assertEqual(amp.states, [True, True, False, False])
 
     def test_muted_play_command_unmutes_and_consumes_toggle(self) -> None:
         command = MenuCommand(CommandType.TOGGLE_PLAYBACK)
@@ -1029,7 +1423,7 @@ class OledServiceTest(unittest.TestCase):
         self.assertFalse(
             should_return_to_active_session(
                 MenuCommand(CommandType.PLAY_BOOK, book_id="book-1", start_over=False, resume_time=60),
-                playback,
+                playback.state,
             )
         )
 
@@ -1085,31 +1479,44 @@ class OledServiceTest(unittest.TestCase):
         self.assertIsNone(overlay)
         self.assertIsNone(state)
 
-    def test_play_book_command_with_result_queue_returns_loading_frame_immediately(self) -> None:
+    def test_play_book_command_shows_loading_before_starting_session(self) -> None:
         menu = ApplianceMenu([Book("book-1", "The Hobbit", "J.R.R. Tolkien", 300, "", current_time=60, progress=0.2)])
-        playback = FakeStartingPlayback()
-        results: queue.SimpleQueue = queue.SimpleQueue()
+        engine = FakeStartingPlayback()
+        playback = PlaybackOwner(engine)
+        self.addCleanup(playback.close)
 
-        with patch("abs_kids_player.oled_service.load_config", return_value=AppConfig("https://books.example.com", "token")):
-            with patch("abs_kids_player.oled_service.AudiobookshelfClient", FakePlaybackClient):
-                overlay = handle_menu_command(
-                    MenuCommand(CommandType.PLAY_BOOK, book_id="book-1", start_over=False, resume_time=60),
-                    menu,
-                    playback,
-                    results,
-                )
-
-                result = results.get(timeout=1)
+        with (
+            patch("abs_kids_player.playback_start.load_config",
+                  return_value=AppConfig("https://books.example.com", "test-secret")),
+            patch("abs_kids_player.playback_start.AudiobookshelfClient", FakePlaybackClient),
+            patch("builtins.print") as printer,
+        ):
+            overlay = handle_menu_command(
+                MenuCommand(CommandType.PLAY_BOOK, book_id="book-1", start_over=False, resume_time=60),
+                menu,
+                playback,
+            )
+            result = wait_for_playback_start(playback)
 
         self.assertEqual(overlay, BOOK_LOADING_FRAME)
         self.assertEqual(result.session.current_time, 60)
-        self.assertEqual(len(playback.started_sessions), 1)
+        self.assertEqual(len(engine.started_sessions), 1)
+        self.assertEqual(engine.start_over_flags, [False])
+        printer.assert_called_once()
+        line = printer.call_args.args[0]
+        self.assertIn("source=audiobookshelf", line)
+        self.assertIn("audiobookshelf_ms=", line)
+        self.assertIn("gst_ms=", line)
+        self.assertIn("select_to_output_ms=", line)
+        self.assertNotIn("test-secret", line)
+        self.assertNotIn("books.example.com", line)
 
     def test_configured_podcast_command_starts_latest_podcast_episode(self) -> None:
         podcast = make_podcast_config()
         menu = ApplianceMenu([podcast_book(podcast)])
-        playback = FakeStartingPlayback()
-        results: queue.SimpleQueue = queue.SimpleQueue()
+        engine = FakeStartingPlayback()
+        playback = PlaybackOwner(engine)
+        self.addCleanup(playback.close)
         session = PlaybackSession(
             id="episode-1",
             library_item_id=podcast.book_id,
@@ -1123,221 +1530,26 @@ class OledServiceTest(unittest.TestCase):
         )
 
         with (
-            patch("abs_kids_player.oled_service.load_config", return_value=AppConfig(podcasts=[podcast])),
-            patch("abs_kids_player.oled_service.latest_podcast_session", return_value=session) as latest_session,
+            patch("abs_kids_player.playback_start.load_config", return_value=AppConfig(podcasts=[podcast])),
+            patch("abs_kids_player.playback_start.latest_podcast_session", return_value=session) as latest_session,
+            patch("builtins.print") as printer,
         ):
             overlay = handle_menu_command(
                 MenuCommand(CommandType.PLAY_BOOK, book_id=podcast.book_id, start_over=True),
                 menu,
                 playback,
-                results,
             )
-            result = results.get(timeout=1)
+            result = wait_for_playback_start(playback)
 
         self.assertEqual(overlay, BOOK_LOADING_FRAME)
-        latest_session.assert_called_once_with(podcast, resume_time=0, start_over=True)
+        latest_session.assert_called_once_with(
+            podcast, resume_time=0, start_over=True, episode_id="", account="local-rss"
+        )
         self.assertEqual(result.session, session)
-        self.assertEqual(playback.started_sessions, [session])
-
-    def test_nav_event_moves_selected_book(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("nav", steps=1))
-        clicks = []
-        spoken = []
-        menu = ApplianceMenu(
-            [
-                Book(id="book-1", title="The Hobbit", author="J.R.R. Tolkien", duration=1, cover_url=""),
-                Book(id="book-2", title="Matilda", author="Roald Dahl", duration=1, cover_url=""),
-            ]
-        )
-
-        _frame, _percent, _muted, changed, commands, pause_playback, resume_playback = handle_oled_input_events(
-            events,
-            menu,
-            control_click_feedback=lambda: clicks.append("click"),
-            spoken_navigation_feedback=spoken.append,
-        )
-
-        self.assertTrue(changed)
-        self.assertEqual(clicks, ["click"])
-        self.assertEqual(commands, [])
-        self.assertFalse(pause_playback)
-        self.assertFalse(resume_playback)
-        self.assertEqual(menu.render().top, "Matilda")
-        self.assertEqual(spoken[0].text, "Matilda")
-        self.assertGreater(spoken[0].delay_seconds, 0)
-
-    def test_nav_click_opens_resume_choice_when_book_has_history(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("nav_click"))
-        clicks = []
-        spoken = []
-        speech_cancels = []
-        menu = ApplianceMenu(
-            [
-                Book(
-                    id="book-1",
-                    title="The Hobbit",
-                    author="J.R.R. Tolkien",
-                    duration=1,
-                    cover_url="",
-                    current_time=30,
-                    progress=0.1,
-                )
-            ]
-        )
-
-        _frame, _percent, _muted, changed, commands, pause_playback, resume_playback = handle_oled_input_events(
-            events,
-            menu,
-            control_click_feedback=lambda: clicks.append("click"),
-            spoken_navigation_feedback=spoken.append,
-            spoken_navigation_cancel=lambda: speech_cancels.append("cancel"),
-        )
-
-        self.assertTrue(changed)
-        self.assertEqual(clicks, ["click"])
-        self.assertEqual(commands, [])
-        self.assertFalse(pause_playback)
-        self.assertFalse(resume_playback)
-        frame = menu.render()
-        self.assertIsInstance(frame, ResumeChoiceFrame)
-        self.assertEqual(frame.top, "The Hobbit")
-        self.assertEqual(frame.options, ("Home", "Continue", "Start over"))
-        self.assertEqual(frame.selected_index, 1)
-        self.assertEqual(spoken[0].text, "Continue")
-        self.assertEqual(spoken[0].delay_seconds, 0)
-        self.assertEqual(speech_cancels, ["cancel"])
-
-    def test_nav_click_without_history_opens_home_start_choice(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("nav_click"))
-        menu = ApplianceMenu(
-            [Book(id="book-1", title="The Hobbit", author="J.R.R. Tolkien", duration=1, cover_url="")]
-        )
-
-        frame, _percent, _muted, changed, commands, pause_playback, resume_playback = handle_oled_input_events(
-            events, menu
-        )
-
-        self.assertTrue(changed)
-        self.assertIsNone(frame)
-        self.assertEqual(commands, [])
-        self.assertFalse(pause_playback)
-        self.assertFalse(resume_playback)
-        rendered = menu.render()
-        self.assertIsInstance(rendered, ResumeChoiceFrame)
-        self.assertEqual(rendered.top, "The Hobbit")
-        self.assertEqual(rendered.options, ("Home", "Start"))
-        self.assertEqual(rendered.selected_index, 1)
-
-    def test_nav_hold_opens_bluetooth_menu(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("nav_hold"))
-        menu = ApplianceMenu()
-
-        frame, _percent, _muted, changed, commands, pause_playback, resume_playback = handle_oled_input_events(
-            events,
-            menu,
-            bluetooth_enabled=False,
-        )
-
-        self.assertIsNone(frame)
-        self.assertTrue(changed)
-        self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0].type, CommandType.PAUSE_PLAYBACK)
-        self.assertFalse(pause_playback)
-        self.assertFalse(resume_playback)
-        rendered = menu.render()
-        self.assertIsInstance(rendered, BluetoothMenuFrame)
-        self.assertFalse(rendered.enabled)
-        self.assertEqual(rendered.options, ("Back", "Enable", "Pair"))
-
-    def test_bluetooth_scan_command_starts_worker_and_returns_pairing_frame(self) -> None:
-        menu = ApplianceMenu()
-        playback = FakePlayback()
-        results: queue.SimpleQueue[BluetoothActionResult] = queue.SimpleQueue()
-
-        with patch("abs_kids_player.oled_service.start_bluetooth_scan_worker") as start_worker:
-            overlay = handle_menu_command(
-                MenuCommand(CommandType.START_BLUETOOTH_SCAN),
-                menu,
-                playback,
-                bluetooth_results=results,
-            )
-
-        start_worker.assert_called_once_with(results)
-        self.assertEqual(overlay, BLUETOOTH_PAIRING_FRAME)
-
-    def test_bluetooth_pair_device_command_starts_worker_for_selected_device(self) -> None:
-        menu = ApplianceMenu()
-        playback = FakePlayback()
-        results: queue.SimpleQueue[BluetoothActionResult] = queue.SimpleQueue()
-
-        with patch("abs_kids_player.oled_service.start_bluetooth_pairing_worker") as start_worker:
-            overlay = handle_menu_command(
-                MenuCommand(
-                    CommandType.PAIR_BLUETOOTH_DEVICE,
-                    bluetooth_device_address="AA:BB:CC:DD:EE:FF",
-                    bluetooth_device_name="Playroom Speaker",
-                ),
-                menu,
-                playback,
-                bluetooth_results=results,
-            )
-
-        self.assertEqual(start_worker.call_args.args[0].address, "AA:BB:CC:DD:EE:FF")
-        self.assertIs(start_worker.call_args.args[1], results)
-        self.assertEqual(overlay.top, "Pairing")
-        self.assertEqual(overlay.bottom, "Playroom Speaker")
-
-    def test_bluetooth_unpair_command_starts_worker(self) -> None:
-        menu = ApplianceMenu()
-        playback = FakePlayback()
-        results: queue.SimpleQueue[BluetoothActionResult] = queue.SimpleQueue()
-
-        with patch("abs_kids_player.oled_service.start_bluetooth_unpair_worker") as start_worker:
-            overlay = handle_menu_command(
-                MenuCommand(CommandType.UNPAIR_BLUETOOTH_DEVICE),
-                menu,
-                playback,
-                bluetooth_results=results,
-            )
-
-        start_worker.assert_called_once_with(results)
-        self.assertEqual(overlay.top, "Unpairing")
-        self.assertEqual(overlay.bottom, "Bluetooth device")
-
-    def test_scan_result_populates_scrollable_bluetooth_device_list(self) -> None:
-        menu = ApplianceMenu()
-
-        menu.set_bluetooth_devices(
-            [
-                ("AA:BB:CC:DD:EE:FF", "Playroom Speaker"),
-                ("11:22:33:44:55:66", "Blue Headphones"),
-            ]
-        )
-        rendered = menu.render()
-
-        self.assertIsInstance(rendered, BluetoothDevicesFrame)
-        self.assertEqual(rendered.top, "Bluetooth Devices")
-        self.assertEqual(rendered.bottom, "Playroom Speaker 2/3")
-
-    def test_bluetooth_scanning_frame_animates_dots(self) -> None:
-        first = bluetooth_scanning_frame(0.0)
-        second = bluetooth_scanning_frame(0.5)
-
-        self.assertEqual(first.top, "Put your device in pairing mode")
-        self.assertEqual(first.bottom, "Searching.")
-        self.assertEqual(second.bottom, "Searching..")
-
-    def test_bluetooth_pairing_frame_animates_dots(self) -> None:
-        first = bluetooth_pairing_frame(TwoLineFrame("Pairing", "Playroom Speaker"), 0.0)
-        second = bluetooth_pairing_frame(TwoLineFrame("Pairing", "Playroom Speaker"), 0.5)
-
-        self.assertEqual(first.top, "Pairing.")
-        self.assertEqual(first.bottom, "Playroom Speaker")
-        self.assertEqual(second.top, "Pairing..")
+        self.assertEqual(engine.started_sessions, [session])
+        self.assertEqual(engine.start_over_flags, [True])
+        printer.assert_called_once()
+        self.assertIn("podcast_ms=", printer.call_args.args[0])
 
     def test_bluetooth_power_command_starts_worker_and_updates_menu(self) -> None:
         menu = ApplianceMenu()
@@ -1355,209 +1567,6 @@ class OledServiceTest(unittest.TestCase):
         start_worker.assert_called_once_with(False, results)
         self.assertFalse(menu.bluetooth_enabled)
         self.assertEqual(overlay, BLUETOOTH_POWER_FRAME)
-
-    def test_volume_click_mute_requests_playback_pause(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume_click"))
-        menu = ApplianceMenu()
-
-        with patch("abs_kids_player.oled_service.toggle_mute", return_value=VolumeState(percent=50, muted=True)):
-            frame, _percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events, menu
-            )
-
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(frame.top, "Muted")
-        self.assertTrue(muted)
-        self.assertTrue(pause_playback)
-        self.assertFalse(resume_playback)
-
-    def test_spoken_navigation_announces_volume_at_ten_percent_intervals(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume", steps=1))
-        events.put(InputEvent("volume", steps=1))
-        menu = ApplianceMenu()
-        spoken = []
-
-        frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-            events,
-            menu,
-            fallback_percent=50,
-            fallback_muted=False,
-            software_volume_only=True,
-            spoken_navigation_feedback=spoken.append,
-        )
-
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(percent, 60)
-        self.assertFalse(muted)
-        self.assertFalse(pause_playback)
-        self.assertFalse(resume_playback)
-        self.assertEqual([selection.text for selection in spoken], ["Volume 60 percent"])
-
-    def test_spoken_navigation_volume_stops_at_ten_percent(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume", steps=-1))
-        menu = ApplianceMenu()
-        spoken = []
-
-        frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-            events,
-            menu,
-            fallback_percent=10,
-            fallback_muted=False,
-            software_volume_only=True,
-            spoken_navigation_feedback=spoken.append,
-        )
-
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(percent, 10)
-        self.assertFalse(muted)
-        self.assertFalse(pause_playback)
-        self.assertFalse(resume_playback)
-        self.assertEqual(spoken, [])
-
-    def test_spoken_navigation_ignores_volume_knob_mute_click(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume_click"))
-        menu = ApplianceMenu()
-        spoken = []
-
-        with patch("abs_kids_player.oled_service.toggle_mute") as toggle:
-            frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events,
-                menu,
-                fallback_percent=50,
-                fallback_muted=False,
-                spoken_navigation_feedback=spoken.append,
-            )
-
-        toggle.assert_not_called()
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(percent, 50)
-        self.assertFalse(muted)
-        self.assertFalse(pause_playback)
-        self.assertFalse(resume_playback)
-        self.assertEqual(spoken, [])
-
-    def test_volume_zero_requests_playback_pause(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume", steps=-1))
-        menu = ApplianceMenu()
-
-        with patch("abs_kids_player.oled_service.change_volume", return_value=VolumeState(percent=0, muted=False)):
-            frame, _percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events, menu
-            )
-
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(frame.top, "Muted")
-        self.assertFalse(muted)
-        self.assertTrue(pause_playback)
-        self.assertFalse(resume_playback)
-
-    def test_volume_up_from_zero_requests_playback_resume(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume", steps=1))
-        menu = ApplianceMenu()
-
-        with patch("abs_kids_player.oled_service.change_volume", side_effect=AudioError("missing audio")):
-            frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events,
-                menu,
-                fallback_percent=0,
-                fallback_muted=False,
-            )
-
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(percent, 5)
-        self.assertFalse(muted)
-        self.assertFalse(frame.is_muted)
-        self.assertFalse(pause_playback)
-        self.assertTrue(resume_playback)
-
-    def test_software_volume_only_skips_system_mixer(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume", steps=-1))
-        menu = ApplianceMenu()
-
-        with patch("abs_kids_player.oled_service.change_volume") as change:
-            frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events,
-                menu,
-                fallback_percent=50,
-                fallback_muted=False,
-                software_volume_only=True,
-            )
-
-        change.assert_not_called()
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(percent, 45)
-        self.assertFalse(muted)
-        self.assertFalse(pause_playback)
-        self.assertFalse(resume_playback)
-
-    def test_software_volume_only_zero_requests_pause_without_system_mixer(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume", steps=-1))
-        menu = ApplianceMenu()
-
-        with patch("abs_kids_player.oled_service.change_volume") as change:
-            frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events,
-                menu,
-                fallback_percent=5,
-                fallback_muted=False,
-                software_volume_only=True,
-            )
-
-        change.assert_not_called()
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(percent, 0)
-        self.assertFalse(muted)
-        self.assertTrue(frame.is_muted)
-        self.assertTrue(pause_playback)
-        self.assertFalse(resume_playback)
-
-    def test_volume_click_from_zero_restores_volume_and_requests_resume(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume_click"))
-        menu = ApplianceMenu()
-
-        with patch("abs_kids_player.oled_service.toggle_mute", side_effect=AudioError("missing audio")):
-            frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events,
-                menu,
-                fallback_percent=0,
-                fallback_muted=False,
-            )
-
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(percent, DEFAULT_UNMUTE_VOLUME_PERCENT)
-        self.assertFalse(muted)
-        self.assertFalse(frame.is_muted)
-        self.assertFalse(pause_playback)
-        self.assertTrue(resume_playback)
-
-    def test_volume_click_unmute_requests_playback_resume(self) -> None:
-        events = queue.SimpleQueue()
-        events.put(InputEvent("volume_click"))
-        menu = ApplianceMenu()
-
-        with patch("abs_kids_player.oled_service.toggle_mute", return_value=VolumeState(percent=50, muted=False)):
-            frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events,
-                menu,
-                fallback_percent=50,
-                fallback_muted=True,
-            )
-
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(percent, 50)
-        self.assertFalse(muted)
-        self.assertFalse(frame.is_muted)
-        self.assertFalse(pause_playback)
-        self.assertTrue(resume_playback)
 
 
 if __name__ == "__main__":
