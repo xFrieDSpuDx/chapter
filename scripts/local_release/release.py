@@ -103,7 +103,8 @@ def enable_boot_recovery():
 def prepare_services():
     recovery = RECOVERY_UNIT
     ordering = f"[Unit]\nRequires={recovery}\nAfter={recovery}\n"
-    local_env = "Environment=CHAPTER_RELEASE_SOURCE=local CHAPTER_LOCAL_TRIAL=1\n"
+    # Older service drop-ins may still export the temporary install marker.
+    local_env = "Environment=CHAPTER_RELEASE_SOURCE=local\nUnsetEnvironment=CHAPTER_LOCAL_TRIAL\n"
     python = "/usr/bin/python3 -EsBu"
     services = {
         OLED: (
@@ -193,12 +194,11 @@ def compatible_selection(target, manifest):
     ):
         return False
     installed = json.loads((previous / "release.json").read_bytes())
-    source_package = manifest.get("previous_package")
+    source_package = manifest["previous_package"]
     previous_candidate = previous.name == source_package and target.name == "candidate"
     # A rolled-back upgrade runs that same accepted player from its fallback slot.
     rolled_back = (
-        source_package
-        and target.name == "fallback"
+        target.name == "fallback"
         and installed.get("previous_package") == source_package
     )
     if previous_candidate or rolled_back:
@@ -217,10 +217,10 @@ def compatible_selection(target, manifest):
 
 
 def check_baseline(manifest):
-    selected = CURRENT.resolve() if CURRENT.is_symlink() else None
-    if not selected and "previous_package" in manifest:
+    if not CURRENT.is_symlink():
         raise RuntimeError("This upgrade requires the previous permanent package to be selected")
-    if selected and not compatible_selection(selected, manifest):
+    selected = CURRENT.resolve()
+    if not compatible_selection(selected, manifest):
         raise RuntimeError("A different local release is selected")
     for unit in LIVE:
         if property_of(unit, "UnitFileState") != "enabled":
@@ -228,30 +228,8 @@ def check_baseline(manifest):
     for unit in (OLED, WEB):
         check_storage_paths(unit)
         running = running_source(unit)
-        if selected and running == selected:
-            continue
-        if selected:
+        if running != selected:
             raise RuntimeError(f"{unit} is using {running} instead of the selected {selected}")
-        expected = Path("/home/chapter") / (
-            "chapter-bluetooth-" + manifest["fallback_archive"][:12]
-        )
-        if running != expected:
-            raise RuntimeError(
-                f"{unit} is using {running}. The packaged fallback must match the active build."
-            )
-        actual = run(
-            "runuser",
-            "-u",
-            "chapter",
-            "--",
-            "/usr/bin/python3",
-            "-IB",
-            str(BUNDLE / "pi_inventory.py"),
-            "package",
-            str(running),
-        )
-        if actual.rsplit("=", 1)[-1] != manifest["fallback"]:
-            raise RuntimeError(f"The active {unit} files differ from the packaged fallback")
     if Path("/var/lib/chapter-update/pending").exists():
         raise RuntimeError("A published-release update is pending recovery")
 
@@ -354,8 +332,6 @@ def activate(manifest):
     before = save_baseline()
     fallback = BUNDLE / "fallback"
     candidate = BUNDLE / "candidate"
-    if not CURRENT.is_symlink():
-        select_release(fallback)
     enable_boot_recovery()
     pending = RECORDS / "pending.json"
     atomic_write(pending, json.dumps({"boot": BOOT_ID.read_text().strip()}).encode())

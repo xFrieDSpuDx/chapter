@@ -1,8 +1,10 @@
-"""Exercise persistent service selection with the Pi's overlapping trial overrides."""
+"""Exercise permanent package upgrades, reboot recovery and rollback."""
 
 import io
 import json
 import subprocess
+import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -10,12 +12,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.local_release import release
+from scripts.local_release.pi_inventory import package_id
 
 
 class LocalReleaseTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.bundle = self.root / "opt/chapter-player/package"
+        self.bundle = self.root / "opt/chapter-player/chapter-local-2222222222222222"
         self.fallback = self.bundle / "fallback"
         self.candidate = self.bundle / "candidate"
         for path in (self.fallback, self.candidate):
@@ -25,7 +28,7 @@ class LocalReleaseTest(unittest.TestCase):
         self.records = self.root / "var/lib/chapter-local-release"
         self.records.mkdir(parents=True)
         self.boot = self.root / "boot-id"
-        self.boot.write_text("boot-one")
+        self.boot.write_text("1")
         self.enterContext(
             patch.multiple(
                 release,
@@ -38,15 +41,24 @@ class LocalReleaseTest(unittest.TestCase):
                 OWNER=self.root / "owner",
             )
         )
-        self.old = Path("/home/chapter/chapter-bluetooth-123456789abc")
+        previous = self.bundle.parent / "chapter-local-1111111111111111"
+        self.previous = previous / "candidate"
+        proxy = Path("deploy/audiobookshelf-player-port80-proxy")
+        for directory in (self.previous, self.fallback):
+            (directory / proxy.parent).mkdir(parents=True)
+            (directory / proxy).write_bytes(b"previous proxy")
         self.manifest = {
-            "fallback_archive": "123456789abc",
-            "fallback": "matched",
+            "previous_package": previous.name,
+            "fallback": "ab0123456789",
             "candidate": "0123456789ab",
-            "package": "test",
+            "package": self.bundle.name,
         }
+        (previous / "release.json").write_text(
+            json.dumps({"package": previous.name, "candidate": self.manifest["fallback"]})
+        )
         (self.bundle / "release.json").write_text(json.dumps(self.manifest))
-        self.running = dict.fromkeys(release.LIVE, self.old)
+        release.select_release(self.previous)
+        self.running = dict.fromkeys(release.LIVE, self.previous)
         self.books = {
             "complete_books": 2,
             "complete_track_bytes": 409710161,
@@ -62,22 +74,18 @@ class LocalReleaseTest(unittest.TestCase):
             patch.object(release, "check_health", side_effect=self.require_running)
         )
         for unit in release.LIVE:
-            for root, name, folder in (
-                (self.systemd, "zzzzz-chapter-reboot-test", "/old-reboot"),
-                (self.systemd, "zzzzzzz-chapter-plugin-preload", "/old-preload"),
-                (self.ram, "zzzzzzzzzz-chapter-bluetooth-test", str(self.old)),
-            ):
-                path = root / (unit + ".d") / (name + ".conf")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("[Service]\nWorkingDirectory=" + folder + "\n")
+            directory = self.systemd / (unit + ".d")
+            directory.mkdir(parents=True)
+            (directory / release.DROP_IN).write_text(
+                f"[Service]\nWorkingDirectory={release.CURRENT}\n"
+                "Environment=CHAPTER_RELEASE_SOURCE=local CHAPTER_LOCAL_TRIAL=1\n"
+            )
 
     def command(self, *args, **kwargs):
         if args[:2] == ("systemctl", "show"):
             return "enabled"
         if args[:2] == ("systemctl", "start"):
             self.start_services()
-        if args[0] == "runuser":
-            return "Package on disk at that path=matched"
         return ""
 
     def start_services(self):
@@ -98,7 +106,7 @@ class LocalReleaseTest(unittest.TestCase):
         self.assertEqual(set(self.running.values()), {target})
 
     def reboot(self):
-        self.boot.write_text("boot-two")
+        self.boot.write_text(str(int(self.boot.read_text()) + 1))
         for path in self.ram.rglob("*.conf"):
             path.unlink()
         release.recover()
@@ -135,9 +143,45 @@ class LocalReleaseTest(unittest.TestCase):
         self.require_running(self.fallback, 0)
         self.assertFalse((self.records / "pending.json").exists())
 
+    def test_manual_rollback_restores_the_previous_build_after_reboot(self):
+        release.activate(self.manifest)
+        self.reboot()
+        release.verify_boot()
+        with (
+            patch.object(release.os, "geteuid", return_value=0),
+            patch.object(sys, "argv", ["release.py", "rollback"]),
+        ):
+            release.main()
+        self.require_running(self.fallback, 0)
+        self.reboot()
+        self.assertEqual(release.CURRENT.resolve(), self.fallback)
+        self.require_running(self.fallback, 0)
+        release.confirm_books(json.loads((self.records / "before.json").read_bytes()))
+
+    def test_services_drop_an_inherited_trial_flag_and_identify_as_local_packages(self):
+        for unit in (*release.LIVE, release.SPLASH):
+            path = self.systemd / (unit + ".d") / "earlier.conf"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("[Service]\nEnvironment=CHAPTER_LOCAL_TRIAL=1\n")
+
+        release.prepare_services()
+
+        for unit in (*release.LIVE, release.SPLASH):
+            with self.subTest(unit=unit):
+                lines = (self.systemd / (unit + ".d") / release.DROP_IN).read_text().splitlines()
+                self.assertIn("Environment=CHAPTER_RELEASE_SOURCE=local", lines)
+                self.assertIn("UnsetEnvironment=CHAPTER_LOCAL_TRIAL", lines)
+                self.assertFalse(
+                    any(
+                        "CHAPTER_LOCAL_TRIAL=" in line
+                        for line in lines
+                        if line.startswith("Environment=")
+                    )
+                )
+
     def test_boot_during_switch_recovers_even_if_only_one_override_was_written(self):
         release.select_release(self.candidate)
-        (self.records / "pending.json").write_text(json.dumps({"boot": "boot-one"}))
+        (self.records / "pending.json").write_text(json.dumps({"boot": self.boot.read_text()}))
         one = self.systemd / (release.OLED + ".d") / release.DROP_IN
         one.write_text(f"[Service]\nWorkingDirectory={release.CURRENT}\n")
         release.recover()
@@ -156,9 +200,9 @@ class LocalReleaseTest(unittest.TestCase):
 
     def test_different_running_build_aborts_before_changing_the_services(self):
         self.running[release.WEB] = Path("/unexpected")
-        with self.assertRaisesRegex(RuntimeError, "packaged fallback"):
+        with self.assertRaisesRegex(RuntimeError, "instead of the selected"):
             release.activate(self.manifest)
-        self.assertFalse(release.CURRENT.exists())
+        self.assertEqual(release.CURRENT.resolve(), self.previous)
         self.assertFalse((self.records / "pending.json").exists())
 
     def test_packaging_repair_upgrades_selected_build_and_preserves_original_inventory(self):
@@ -186,31 +230,13 @@ class LocalReleaseTest(unittest.TestCase):
         self.assertEqual(release.CURRENT.resolve(), previous / "candidate")
         self.assertFalse((self.records / "pending.json").exists())
 
-    def select_previous_package(self):
-        previous = self.bundle.parent / "chapter-local-7f690f23e02c9362"
-        selected = previous / "candidate"
-        for root in (selected, self.fallback):
-            (root / "deploy").mkdir(parents=True)
-            (root / "deploy/audiobookshelf-player-port80-proxy").write_bytes(b"previous proxy")
-        (previous / "release.json").write_text(
-            json.dumps({"package": previous.name, "candidate": self.manifest["fallback"]})
-        )
-        release.select_release(selected)
-        self.running.update(dict.fromkeys(release.LIVE, selected))
-        self.manifest.pop("fallback_archive")
-        self.manifest["previous_package"] = previous.name
-        (self.bundle / "release.json").write_text(json.dumps(self.manifest))
-        return selected
-
     def test_upgrade_from_named_previous_candidate_survives_reboot(self):
-        selected = self.select_previous_package()
         release.activate(self.manifest)
-        self.runner.assert_any_call("dpkg", "--verify", selected.parent.name)
+        self.runner.assert_any_call("dpkg", "--verify", self.previous.parent.name)
         self.reboot()
         release.verify_boot()
 
     def test_failed_upgrade_restores_previous_player_and_preserves_books(self):
-        self.select_previous_package()
         self.health.side_effect = [RuntimeError("missing navigation dial"), None]
         with self.assertRaisesRegex(RuntimeError, "restored"):
             release.activate(self.manifest)
@@ -219,7 +245,7 @@ class LocalReleaseTest(unittest.TestCase):
         release.confirm_books(json.loads((self.records / "before.json").read_bytes()))
 
     def test_repair_can_upgrade_the_verified_rollback_slot_of_a_failed_release(self):
-        accepted = self.select_previous_package().parent
+        accepted = self.previous.parent
         failed = self.bundle.parent / "chapter-local-0000000000000001"
         fallback = failed / "fallback"
         proxy = Path("deploy/audiobookshelf-player-port80-proxy")
@@ -242,7 +268,7 @@ class LocalReleaseTest(unittest.TestCase):
         release.verify_boot()
 
     def test_upgrade_requires_matching_previous_build_role_and_proxy(self):
-        selected = self.select_previous_package()
+        selected = self.previous
         self.assertFalse(release.compatible_selection(selected.parent / "fallback", self.manifest))
         for change in (
             {"previous_package": "chapter-local-0000000000000000"},
@@ -258,7 +284,6 @@ class LocalReleaseTest(unittest.TestCase):
         self.assertFalse((self.records / "pending.json").exists())
 
     def test_upgrade_rejects_unmanaged_install(self):
-        self.select_previous_package()
         release.CURRENT.unlink()
         with self.assertRaisesRegex(RuntimeError, "previous permanent package"):
             release.activate(self.manifest)
@@ -275,6 +300,70 @@ class LocalReleaseTest(unittest.TestCase):
             self.assertIn(f"RuntimeDirectory={directory}", lines)
             self.assertIn("RuntimeDirectoryMode=0700", lines)
             self.assertIn(f"Environment=LG_WD=/run/{directory}", lines)
+
+
+class LocalPackageBuilderTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.stage = self.root / "stage"
+        self.previous = self.root / "chapter-local-1111111111111111"
+        self.runtime = self.previous / "candidate"
+        for name in (
+            "abs_kids_player/oled_service.py",
+            "abs_kids_player/setup_server.py",
+            "deploy/audiobookshelf-player-port80-proxy",
+        ):
+            path = self.runtime / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name)
+        self.build_id = package_id(self.runtime)
+        (self.previous / "release.json").write_text(
+            json.dumps(
+                {
+                    "candidate": self.build_id,
+                    "package": self.previous.name,
+                }
+            )
+        )
+
+    def build(self, previous):
+        builder = Path(__file__).resolve().parents[1] / "scripts/local_release/build.py"
+        return subprocess.run(
+            [sys.executable, "-B", str(builder), str(self.stage), str(previous)],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_build_copies_the_previous_package_candidate_for_rollback(self):
+        result = self.build(self.previous)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads(result.stdout)
+        self.assertEqual(manifest["previous_package"], self.previous.name)
+        self.assertEqual(manifest["fallback"], self.build_id)
+        fallback = self.stage / "opt/chapter-player" / manifest["package"] / "fallback"
+        for original in self.runtime.rglob("*"):
+            if original.is_file():
+                self.assertEqual(
+                    (fallback / original.relative_to(self.runtime)).read_bytes(),
+                    original.read_bytes(),
+                )
+
+    def test_build_rejects_a_source_archive(self):
+        archive = self.root / "source.tar.gz"
+        with tarfile.open(archive, "w:gz") as stream:
+            for path in self.runtime.rglob("*"):
+                if path.is_file():
+                    stream.add(path, arcname=str(path.relative_to(self.runtime)))
+        result = self.build(archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("extracted directory of the previous permanent Debian package", result.stderr)
+        self.assertFalse((self.stage / "DEBIAN/control").exists())
+
+    def test_build_rejects_a_changed_previous_player(self):
+        (self.runtime / "abs_kids_player/oled_service.py").write_text("changed")
+        result = self.build(self.previous)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("previous player files differ from its manifest", result.stderr)
 
 
 class DialHealthTest(unittest.TestCase):

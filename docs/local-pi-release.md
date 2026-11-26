@@ -62,7 +62,7 @@ Look for **rollback passed** and the expected fallback ID. The selection survive
 
 On a Debian build machine, use Bash, Git, Python 3.11 or newer, `dpkg-deb` (from `dpkg`) and `sha256sum` (from `coreutils`). Start in the root of the reviewed Chapter checkout containing `scripts/local_release/build.py`. The builder packages the runtime files in the working tree, including eligible untracked files. Check `git status --short` before building.
 
-You also need the **previously accepted Debian file** whose candidate is running on the target Pi. The builder validates its runtime against its manifest and bundles it as the fallback. If you only have a fresh Pi, use the [fresh install procedure](raspberry-pi-zero-2w-install.md#run-the-installer).
+Use the **previously accepted Debian file** whose candidate matches the build ID on the target Pi. The builder takes its extracted package directory, verifies the player files against its manifest and bundles them for rollback. During activation, the OLED and setup services must both be running the selected permanent build. If you only have a fresh Pi, use the [fresh install procedure](raspberry-pi-zero-2w-install.md#run-the-installer).
 
 Run this block in Bash. At the prompt, paste the full path to the previous package, without shell quotes. The output goes into a new release-specific directory under `~/chapter-packages/`. Keep that directory so you can use its Debian file as the baseline for the next upgrade.
 

@@ -31,6 +31,6 @@ If Chapter detects that another player moved the book during an online session, 
 
 ## If downloaded books appear to be missing
 
-First clear the Library filters and open **Downloads**. In **Connections**, check the Audiobookshelf server address and account. Chapter keeps each account’s downloads separate. Also check the active build in **System → System status and diagnostics**. A temporary trial can end at reboot.
+First clear the Library filters and open **Downloads**. In **Connections**, check the Audiobookshelf server address and account. Chapter keeps each account’s downloads separate. If the shelf changed after an upgrade, check the active build in **System → System status and diagnostics**. For a local package, follow the [reboot verification steps](local-pi-release.md#verify-a-full-reboot).
 
 On a standard installation, Chapter keeps audio in the service user’s home under `~/.local/state/abs-kids-player/downloads/`, outside the application checkout. Each completed book has a `book.json` record and its `track-*` files. A leftover `.lock` file alone cannot establish whether a download completed or why it is missing. If you are investigating a loss, record the build, download count and free space before downloading replacements. The settings backup exports preferences only.

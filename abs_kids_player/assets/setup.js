@@ -59,9 +59,6 @@
       } else if (status.phase === "local") {
         statusText.textContent = "Local package installed";
         description.textContent = status.message || "";
-      } else if (status.phase === "trial") {
-        statusText.textContent = "Local trial build";
-        description.textContent = status.message || "";
       } else if (status.phase === "error") {
         statusText.textContent = softwareUpdateWasInstalling ? "Finishing update..." : "Update check needs attention";
         description.textContent = softwareUpdateWasInstalling

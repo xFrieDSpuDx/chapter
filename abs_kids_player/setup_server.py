@@ -1200,9 +1200,6 @@ class SetupHandler(SetupHTTPHandler):
         if os.environ.get("CHAPTER_RELEASE_SOURCE") == "local":
             self.send_request_error(409, "This release is installed locally. Use the local release installer.")
             return
-        if os.environ.get("CHAPTER_LOCAL_TRIAL") == "1":
-            self.send_request_error(409, "Restore the installed build to use online updates.")
-            return
         with update_request_lock:
             if update_state_is_active(load_update_state()):
                 self.send_request_error(409, "A software update is already running.")
@@ -1291,12 +1288,6 @@ class SetupHandler(SetupHTTPHandler):
     def send_system_update_status_json(self) -> None:
         if os.environ.get("CHAPTER_RELEASE_SOURCE") == "local":
             self.send_json({"phase": "local", "updateAvailable": False, "message": "Installed from a local package."})
-            return
-        if os.environ.get("CHAPTER_LOCAL_TRIAL") == "1":
-            self.send_json({
-                "phase": "trial", "updateAvailable": False,
-                "message": "Online updates are paused while the local trial build is running.",
-            })
             return
         self.send_json(update_status_payload())
 

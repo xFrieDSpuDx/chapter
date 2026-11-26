@@ -579,31 +579,24 @@ class SetupServerTest(unittest.TestCase):
         handler.send_request_error.assert_called_once_with(409, "A software update is already running.")
         schedule_update.assert_not_called()
 
-    def test_online_update_actions_are_suspended_during_a_temporary_trial(self) -> None:
-        handler = object.__new__(SetupHandler)
-        handler.send_request_error = Mock()
-        handler.send_json = Mock()
-        with (
-            patch.dict(os.environ, {"CHAPTER_LOCAL_TRIAL": "1"}),
-            patch("abs_kids_player.setup_server.schedule_software_update") as schedule_update,
-            patch("abs_kids_player.setup_server.update_status_payload") as update_status,
-        ):
-            handler.handle_system_update_post()
-            handler.send_system_update_status_json()
-        schedule_update.assert_not_called()
-        update_status.assert_not_called()
-        handler.send_request_error.assert_called_once_with(409, "Restore the installed build to use online updates.")
-        self.assertEqual(handler.send_json.call_args.args[0]["phase"], "trial")
-        self.assertFalse(handler.send_json.call_args.args[0]["updateAvailable"])
-
     def test_permanent_local_package_reports_its_source_and_keeps_online_updates_off(self):
         handler = object.__new__(SetupHandler)
         handler.send_json, handler.send_request_error = Mock(), Mock()
-        with patch.dict(os.environ, {"CHAPTER_RELEASE_SOURCE": "local", "CHAPTER_LOCAL_TRIAL": "1"}):
+        with (
+            patch.dict(os.environ, {"CHAPTER_RELEASE_SOURCE": "local"}, clear=True),
+            patch("abs_kids_player.setup_server.schedule_software_update") as schedule_update,
+            patch("abs_kids_player.setup_server.update_status_payload") as update_status,
+        ):
             handler.send_system_update_status_json()
             handler.handle_system_update_post()
-        self.assertEqual(handler.send_json.call_args.args[0]["phase"], "local")
-        self.assertEqual(handler.send_request_error.call_args.args[0], 409)
+        handler.send_json.assert_called_once_with({
+            "phase": "local", "updateAvailable": False, "message": "Installed from a local package.",
+        })
+        handler.send_request_error.assert_called_once_with(
+            409, "This release is installed locally. Use the local release installer."
+        )
+        schedule_update.assert_not_called()
+        update_status.assert_not_called()
 
     def test_system_update_status_get_returns_json_payload(self) -> None:
         handler = object.__new__(SetupHandler)

@@ -6,7 +6,6 @@ import json
 import re
 import shutil
 import subprocess
-import tarfile
 from pathlib import Path
 
 from pi_inventory import package_id
@@ -39,39 +38,27 @@ def allowed(path):
 
 
 def stage_fallback(source, destination):
-    if source.is_dir():
-        # Use the candidate tree from the extracted, previously accepted Debian package.
-        installed = json.loads((source / "release.json").read_bytes())
-        if not re.fullmatch(r"chapter-local-[0-9a-f]{16}", source.name) or (
-            source.name != installed["package"]
-        ):
-            raise ValueError("The previous package directory does not match its manifest")
-        candidate = source / "candidate"
-        for entry in candidate.rglob("*"):
-            path = entry.relative_to(candidate)
-            if entry.is_symlink():
-                raise ValueError(f"Unexpected link in previous package: {path}")
-            if entry.is_dir():
-                continue
-            if not entry.is_file() or not allowed(path):
-                raise ValueError(f"Unexpected previous package entry: {path}")
-            target = destination / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(entry, target)
-        if package_id(destination) != installed["candidate"]:
-            raise ValueError("The previous player files differ from its manifest")
-        return {"previous_package": source.name}
-
-    with tarfile.open(source, "r:gz") as archive:
-        for member in archive:
-            path = Path(member.name)
-            if not member.isfile() or not allowed(path):
-                raise ValueError(f"Unexpected fallback entry: {path}")
-            target = destination / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("xb") as stream, archive.extractfile(member) as content:
-                shutil.copyfileobj(content, stream)
-    return {"fallback_archive": hashlib.sha256(source.read_bytes()).hexdigest()}
+    if not source.is_dir():
+        raise ValueError("Expected the extracted directory of the previous permanent Debian package")
+    installed = json.loads((source / "release.json").read_bytes())
+    if not re.fullmatch(r"chapter-local-[0-9a-f]{16}", source.name) or (
+        source.name != installed["package"]
+    ):
+        raise ValueError("The previous package directory does not match its manifest")
+    candidate = source / "candidate"
+    for entry in candidate.rglob("*"):
+        path = entry.relative_to(candidate)
+        if entry.is_symlink():
+            raise ValueError(f"Unexpected link in previous package: {path}")
+        if entry.is_dir():
+            continue
+        if not entry.is_file() or not allowed(path):
+            raise ValueError(f"Unexpected previous package entry: {path}")
+        target = destination / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(entry, target)
+    if package_id(destination) != installed["candidate"]:
+        raise ValueError("The previous player files differ from its manifest")
 
 
 def stage_package(stage, fallback):
@@ -100,7 +87,8 @@ def stage_package(stage, fallback):
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO / path, destination)
     previous = payload / "fallback"
-    origin = stage_fallback(fallback, previous)
+    stage_fallback(fallback, previous)
+    origin = {"previous_package": fallback.name}
     for name in ("release.py", "pi_inventory.py", "pi_checks.py"):
         shutil.copyfile(SCRIPTS / name, payload / name)
     for build in (candidate, previous):
@@ -146,7 +134,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", type=Path, help="A new packaging directory")
     parser.add_argument(
-        "fallback", type=Path, help="Extracted previous package directory or initial trial tar.gz"
+        "fallback", type=Path, help="Extracted directory of the previous permanent Debian package"
     )
     arguments = parser.parse_args()
     print(json.dumps(stage_package(arguments.stage, arguments.fallback), indent=2))
