@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import time
 import zlib
+from datetime import datetime
 from pathlib import Path
+
+from .bedtime import night_hours_active
+from .config import ConfigReadError, load_config
 
 
 CHAPTER_SPLASH_PACKED = zlib.decompress(
@@ -93,7 +97,7 @@ class BootSplashDisplay:
             self.spi.xfer2(list(values[index : index + 4096]))
 
     def show(self, _frame: SplashFrame) -> None:
-        self.command([0x00, 0x10, 0xB0])
+        self.command([0x00, 0x10, 0xB0, 0x00])  # Column 0, row 0.
         self.data(CHAPTER_SPLASH_PACKED)
 
     def release_gpio(self) -> None:
@@ -121,6 +125,13 @@ def show_boot_splash(
     startup_timeout_seconds: float = 5.0,
     startup_poll_seconds: float = 0.05,
 ) -> None:
+    try:
+        config = load_config()
+    except ConfigReadError:
+        pass  # The main service displays the settings error.
+    else:
+        if night_hours_active(config.screen_off_start, config.screen_off_end, datetime.now()):
+            return
     display = open_display(
         spi_bus,
         spi_device,

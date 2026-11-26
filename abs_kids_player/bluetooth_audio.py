@@ -7,6 +7,13 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
+from .bluetooth_commands import (
+    CommandResult,
+    combine_output,
+    run_bluetoothctl,
+    run_bluetoothctl_with_agent,
+)
+
 
 DEFAULT_PAIR_SCAN_SECONDS = 30
 EXTRA_AUDIO_NAME_SCAN_SECONDS = 15
@@ -56,12 +63,6 @@ DEVICE_PROPERTY_PREFIXES = (
 
 
 @dataclass(frozen=True)
-class CommandResult:
-    returncode: int
-    output: str = ""
-
-
-@dataclass(frozen=True)
 class BluetoothDevice:
     address: str
     name: str
@@ -80,66 +81,6 @@ class BluetoothActionResult:
 
 BluetoothctlRunner = Callable[[Sequence[str], float], CommandResult]
 BluetoothScanner = Callable[[float, BluetoothctlRunner], list[BluetoothDevice]]
-
-
-def run_bluetoothctl(args: Sequence[str], timeout: float = 5.0) -> CommandResult:
-    try:
-        completed = subprocess.run(
-            ["bluetoothctl", *args],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=timeout,
-        )
-    except FileNotFoundError:
-        return CommandResult(127, "bluetoothctl is not installed")
-    except subprocess.TimeoutExpired as error:
-        output = combine_output(error.stdout, error.stderr)
-        return CommandResult(124, output or "bluetoothctl timed out")
-
-    return CommandResult(
-        completed.returncode,
-        combine_output(completed.stdout, completed.stderr),
-    )
-
-
-def run_bluetoothctl_with_agent(args: Sequence[str], timeout: float = 30.0) -> CommandResult:
-    timeout_seconds = max(1, int(timeout))
-    try:
-        completed = subprocess.run(
-            [
-                "bluetoothctl",
-                "--agent",
-                "NoInputNoOutput",
-                "--timeout",
-                str(timeout_seconds),
-                *args,
-            ],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=timeout_seconds + 5,
-        )
-    except FileNotFoundError:
-        return CommandResult(127, "bluetoothctl is not installed")
-    except subprocess.TimeoutExpired as error:
-        output = combine_output(error.stdout, error.stderr)
-        return CommandResult(124, output or "bluetoothctl timed out")
-
-    return CommandResult(
-        completed.returncode,
-        combine_output(completed.stdout, completed.stderr),
-    )
-
-
-def combine_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
-    parts = []
-    for value in (stdout, stderr):
-        if isinstance(value, bytes):
-            value = value.decode(errors="replace")
-        if value:
-            parts.append(value.strip())
-    return "\n".join(parts).strip()
 
 
 def bluetooth_powered(runner: BluetoothctlRunner = run_bluetoothctl) -> bool:
@@ -263,50 +204,21 @@ def pair_bluetooth_device(
     device: BluetoothDevice,
     runner: BluetoothctlRunner = run_bluetoothctl,
 ) -> BluetoothActionResult:
+    # Keep the synchronous entry point on the same verified path as the OLED.
+    from .bluetooth_connection import connect_speaker, playback_endpoint_ready
+    from .bluetooth_speakers import Speaker, SpeakerError
+
     device = enrich_device_name(device, runner)
-
-    last_error = ""
-    pair_result = (
-        run_bluetoothctl_with_agent(["pair", device.address], 30.0)
-        if runner is run_bluetoothctl
-        else runner(["pair", device.address], 30.0)
-    )
-    print(f"Bluetooth pair {device.address} {device.name}: {pair_result.returncode} {pair_result.output}")
-    if pair_result.returncode != 0 and not already_paired(pair_result.output):
-        last_error = short_message(pair_result.output, fallback="Pairing failed")
-
-    runner(["trust", device.address], 10.0)
-    connect_result = connect_bluetooth_device(device, runner)
-    info_result = runner(["info", device.address], 5.0)
-    print(f"Bluetooth connect {device.address} {device.name}: {connect_result.returncode} {connect_result.output}")
-    print(f"Bluetooth info {device.address} {device.name}: {info_result.output}")
-    if connected_info(info_result.output) or "Connection successful" in connect_result.output:
-        return BluetoothActionResult(
-            True,
-            "Bluetooth connected",
-            enabled=True,
-            connected=True,
-            device_address=device.address,
-            device_name=device.name,
+    try:
+        connect_speaker(
+            Speaker(device.address, device.name), lambda _stage: None, runner=runner,
+            pair=run_bluetoothctl_with_agent if runner is run_bluetoothctl else runner,
+            ready=playback_endpoint_ready,
         )
-    last_error = short_message(connect_result.output, fallback="Could not connect")
-
-    return BluetoothActionResult(False, last_error or "Could not connect", enabled=True)
-
-
-def connect_bluetooth_device(
-    device: BluetoothDevice,
-    runner: BluetoothctlRunner = run_bluetoothctl,
-    attempts: int = 3,
-) -> CommandResult:
-    last_result = CommandResult(1, "Could not connect")
-    for attempt in range(max(1, attempts)):
-        last_result = runner(["connect", device.address], 20.0)
-        if connection_successful(last_result.output):
-            return last_result
-        if attempt < attempts - 1:
-            time.sleep(1.0)
-    return last_result
+    except SpeakerError as error:
+        return BluetoothActionResult(False, f"{error.stage} failed", enabled=True)
+    return BluetoothActionResult(True, "Speaker ready", enabled=True, connected=True,
+                                 device_address=device.address, device_name=device.name)
 
 
 def unpair_connected_bluetooth_audio_device(
@@ -346,79 +258,6 @@ def unpair_connected_bluetooth_audio_device(
         device_address=device.address,
         device_name=device.name,
     )
-
-
-def remove_bluetooth_device(
-    device: BluetoothDevice,
-    runner: BluetoothctlRunner = run_bluetoothctl,
-    attempts: int = 3,
-) -> CommandResult:
-    last_result = CommandResult(1, "Could not unpair")
-    for _attempt in range(max(1, attempts)):
-        last_result = runner(["remove", device.address], 10.0)
-        if last_result.returncode == 0 or "Device has been removed" in last_result.output:
-            return CommandResult(0, last_result.output)
-        time.sleep(0.4)
-    return last_result
-
-
-def bluetooth_device_removed(
-    address: str,
-    runner: BluetoothctlRunner = run_bluetoothctl,
-) -> bool:
-    info = runner(["info", address], 5.0)
-    if info.returncode != 0:
-        return True
-    lower = info.output.lower()
-    return "not available" in lower or "missing device address" in lower
-
-
-def pair_bluetooth_device_with_live_scan(device: BluetoothDevice) -> CommandResult:
-    commands = [
-        ("power on\n", 0.3),
-        ("agent NoInputNoOutput\n", 0.3),
-        ("default-agent\n", 0.3),
-        ("pairable on\n", 0.3),
-        ("scan on\n", 8.0),
-        (f"pair {device.address}\n", 10.0),
-        (f"trust {device.address}\n", 1.0),
-        (f"connect {device.address}\n", 8.0),
-        (f"info {device.address}\n", 1.0),
-        ("quit\n", 0.1),
-    ]
-    try:
-        process = subprocess.Popen(
-            ["bluetoothctl", "--agent", "NoInputNoOutput"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    except FileNotFoundError:
-        return CommandResult(127, "bluetoothctl is not installed")
-
-    output = ""
-    try:
-        if process.stdin is None:
-            return CommandResult(1, "bluetoothctl stdin unavailable")
-        for command, delay in commands:
-            process.stdin.write(command)
-            process.stdin.flush()
-            time.sleep(delay)
-        process.stdin.close()
-        process.stdin = None
-        output, _ = process.communicate(timeout=10)
-    except (BrokenPipeError, ValueError) as error:
-        try:
-            process.kill()
-            output, _ = process.communicate(timeout=5)
-        except Exception:
-            pass
-        return CommandResult(1, f"bluetoothctl command failed: {error}\n{output}")
-    except subprocess.TimeoutExpired:
-        process.kill()
-        output, _ = process.communicate(timeout=5)
-    return CommandResult(process.returncode or 0, output or "")
 
 
 def scan_for_devices(
@@ -591,11 +430,6 @@ def audio_device_name(name: str) -> bool:
     return any(marker in lower for marker in AUDIO_NAME_MARKERS)
 
 
-def already_paired(output: str) -> bool:
-    lower = output.lower()
-    return "already" in lower and ("paired" in lower or "exists" in lower)
-
-
 def connected_info(info: str) -> bool:
     return "Connected: yes" in info
 
@@ -649,7 +483,11 @@ def bluealsa_available() -> bool:
     return "bluealsa" in completed.stdout.lower()
 
 
-def preferred_bluetooth_alsa_device() -> str | None:
+def preferred_bluetooth_alsa_device(address: str = "") -> str | None:
+    if address:
+        if not connected_info(run_bluetoothctl(["info", address]).output):
+            return None
+        return f"bluealsa:DEV={address},PROFILE=a2dp"
     if not bluealsa_available():
         return None
     device = connected_bluetooth_audio_device()

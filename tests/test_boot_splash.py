@@ -3,9 +3,15 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
-from abs_kids_player.boot_splash import CHAPTER_SPLASH_PACKED, open_display, show_boot_splash
+from abs_kids_player.boot_splash import (
+    CHAPTER_SPLASH_PACKED,
+    BootSplashDisplay,
+    SplashFrame,
+    open_display,
+    show_boot_splash,
+)
 
 
 class FakeSpi:
@@ -33,6 +39,15 @@ class FakeDisplay:
 
 
 class BootSplashTest(unittest.TestCase):
+    def test_boot_logo_sets_both_row_address_bytes_before_image_data(self):
+        display = object.__new__(BootSplashDisplay)
+        bus = Mock()
+        display.command, display.data = bus.command, bus.data
+        display.show(SplashFrame("chapter"))
+        self.assertEqual(bus.method_calls, [
+            call.command([0x00, 0x10, 0xB0, 0x00]), call.data(CHAPTER_SPLASH_PACKED),
+        ])
+
     def setUp(self) -> None:
         FakeDisplay.instances = []
 
@@ -44,6 +59,18 @@ class BootSplashTest(unittest.TestCase):
         self.assertEqual(display.frames[0].text, "chapter")
         self.assertTrue(display.spi.closed)
         self.assertFalse(display.closed)
+
+    def test_scheduled_boot_skips_the_early_splash(self):
+        with (
+            patch("abs_kids_player.boot_splash.load_config") as load,
+            patch("abs_kids_player.boot_splash.datetime") as clock,
+            patch("abs_kids_player.boot_splash.open_display") as open_display,
+        ):
+            load.return_value.screen_off_start = "22:00"
+            load.return_value.screen_off_end = "07:00"
+            clock.now.return_value.strftime.return_value = "02:30"
+            show_boot_splash()
+            open_display.assert_not_called()
 
     def test_pre_rendered_splash_matches_full_display_frame_size(self) -> None:
         self.assertEqual(len(CHAPTER_SPLASH_PACKED), 256 * 64 // 2)

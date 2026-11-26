@@ -72,7 +72,7 @@ def wifi_is_connected(runner: CommandRunner = run_command) -> bool:
 
 
 def current_wifi_ssid(runner: CommandRunner = run_command) -> str:
-    result = nmcli(["-t", "-f", "ACTIVE,SSID", "device", "wifi", "list"], runner)
+    result = nmcli(["-t", "-f", "ACTIVE,SSID", "device", "wifi", "list", "--rescan", "no"], runner)
     for line in result.stdout.splitlines():
         fields = split_nmcli_fields(line)
         if len(fields) >= 2 and fields[0] == "yes":
@@ -80,7 +80,11 @@ def current_wifi_ssid(runner: CommandRunner = run_command) -> str:
     return ""
 
 
-def wifi_status(runner: CommandRunner = run_command) -> WifiStatus:
+def run_status_command(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(args, capture_output=True, check=True, text=True, timeout=5)
+
+
+def wifi_status(runner: CommandRunner = run_status_command) -> WifiStatus:
     try:
         ssid = current_wifi_ssid(runner)
         if ssid:
@@ -88,7 +92,9 @@ def wifi_status(runner: CommandRunner = run_command) -> WifiStatus:
         if wifi_is_connected(runner):
             return WifiStatus(connected=True, message="Connected, SSID unavailable")
         return WifiStatus(connected=False, message="Not connected")
-    except WifiError as error:
+    except subprocess.TimeoutExpired:
+        return WifiStatus(connected=False, message="Wi-Fi status timed out")
+    except (WifiError, OSError) as error:
         return WifiStatus(connected=False, message=str(error))
 
 
