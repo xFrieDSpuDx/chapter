@@ -225,6 +225,58 @@ class ApiMetadataTest(unittest.TestCase):
 
         self.assertEqual([book.series_position for book in books], ["2/7", "7/7"])
 
+    def test_library_load_uses_one_progress_request_for_the_whole_account(self) -> None:
+        client = AudiobookshelfClient("https://books.example.com", "token")
+        items = [{"id": f"book-{index}"} for index in range(50)]
+        progress = {
+            "mediaProgress": [
+                {"libraryItemId": "book-2", "currentTime": 20, "progress": 0.2},
+                {"libraryItemId": "book-2", "episodeId": "episode-1", "currentTime": 80},
+                {"libraryItemId": "another-library", "currentTime": 90},
+            ]
+        }
+        with patch.object(
+            client, "request", side_effect=[{"results": []}, {"results": items}, progress]
+        ) as request:
+            books = client.get_books("library-1")
+
+        self.assertEqual(len(books), 50)
+        self.assertEqual(books[2].current_time, 20)
+        self.assertEqual(books[2].progress, 0.2)
+        self.assertEqual(books[3].current_time, 0)
+        self.assertEqual(
+            [call.args[1] for call in request.call_args_list],
+            ["/api/libraries/library-1/series", "/api/libraries/library-1/items", "/api/me"],
+        )
+
+    def test_library_load_uses_per_item_progress_when_account_data_is_omitted(self) -> None:
+        client = AudiobookshelfClient("https://books.example.com", "token")
+        items = [{"id": "book-1", "mediaProgress": {"currentTime": 8}}, {"id": "book-2"}]
+        with patch.object(
+            client,
+            "request",
+            side_effect=[
+                {"results": []}, {"results": items}, {"username": "chapter"}, {"currentTime": 42},
+            ],
+        ) as request:
+            books = client.get_books("library-1")
+
+        self.assertEqual([book.current_time for book in books], [8, 42])
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual(request.call_args.args[1], "/api/me/progress/book-2")
+
+    def test_library_load_does_not_fan_out_progress_requests_after_timeout(self) -> None:
+        client = AudiobookshelfClient("https://books.example.com", "token")
+        with patch.object(
+            client,
+            "request",
+            side_effect=[{"results": []}, {"results": [{"id": "book-1"}]}, AudiobookshelfError("timed out")],
+        ) as request:
+            with self.assertRaisesRegex(AudiobookshelfError, "timed out"):
+                client.get_books("library-1")
+
+        self.assertEqual(request.call_count, 3)
+
     def test_request_converts_socket_timeout_to_audiobookshelf_error(self) -> None:
         client = AudiobookshelfClient("https://books.example.com", "token")
 
@@ -265,6 +317,36 @@ class ApiMetadataTest(unittest.TestCase):
         session = client.start_playback("book-1", start_over=False, resume_time=67.0)
 
         self.assertEqual(session.current_time, 67.0)
+
+    def test_start_playback_retains_track_identifiers_and_server_play_method(self) -> None:
+        client = FakePlaybackClient()
+        with patch.object(
+            client,
+            "request",
+            return_value={
+                "id": "play-1",
+                "playMethod": 0,
+                "duration": 300,
+                "audioTracks": [
+                    {
+                        "ino": "551100",
+                        "metadata": {"size": 1000000000, "path": "/private/books/one.m4b"},
+                        "contentUrl": "/tracks/one.m4b?token=old",
+                    },
+                    {
+                        "metadata": {"size": "unavailable"},
+                        "contentUrl": "/audiobookshelf/api/items/book-1/file/551102?token=old",
+                    },
+                    {"ino": "../private", "contentUrl": "/tracks/three.m4b"},
+                ],
+            },
+        ):
+            session = client.start_playback("book-1")
+
+        self.assertEqual(session.play_method, 0)
+        self.assertEqual([track.file_id for track in session.tracks], [551100, 551102, None])
+        self.assertEqual([track.size_bytes for track in session.tracks], [1000000000, None, None])
+        self.assertTrue(session.tracks[0].url.endswith("?token=token"))
 
     def test_update_progress_syncs_open_session_and_media_progress(self) -> None:
         client = FakeProgressClient()

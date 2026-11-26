@@ -6,7 +6,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .storage import ensure_storage_directory, finalize_storage_file
+from .audio import VolumeState
+from .storage import write_json_atomically
 
 
 STATE_DIR = Path.home() / ".local" / "state" / "abs-kids-player"
@@ -19,6 +20,8 @@ class LastPlaybackState:
     title: str
     current_time: float = 0
     updated_at: float = 0
+    episode_id: str = ""
+    account: str = ""
 
     @property
     def is_ready(self) -> bool:
@@ -40,24 +43,34 @@ def load_player_state() -> LastPlaybackState | None:
         title=str(data.get("title", "")),
         current_time=float(data.get("current_time") or 0),
         updated_at=float(data.get("updated_at") or 0),
+        episode_id=str(data.get("episode_id") or ""),
+        account=str(data.get("account") or ""),
     )
     return state if state.is_ready else None
 
 
-def save_last_playback(book_id: str, title: str, current_time: float, now: float | None = None) -> None:
+def save_last_playback(
+    book_id: str,
+    title: str,
+    current_time: float,
+    now: float | None = None,
+    *,
+    episode_id: str = "",
+    account: str = "",
+) -> None:
     state = LastPlaybackState(
         book_id=book_id,
         title=title,
         current_time=max(0.0, current_time),
         updated_at=time.time() if now is None else now,
+        episode_id=episode_id,
+        account=account,
     )
     if not state.is_ready:
         return
 
     path = state_path()
-    ensure_storage_directory(path.parent)
-    path.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
-    finalize_storage_file(path)
+    write_json_atomically(path, asdict(state))
 
 
 def clear_last_playback() -> None:
@@ -65,6 +78,58 @@ def clear_last_playback() -> None:
         state_path().unlink(missing_ok=True)
     except OSError:
         pass
+
+
+@dataclass(frozen=True)
+class OutputVolumes:
+    speaker: VolumeState
+    bluetooth: VolumeState
+
+    def for_output(self, output: str) -> VolumeState:
+        return self.bluetooth if output == "bluetooth" else self.speaker
+
+    def with_level(self, output: str, volume: VolumeState) -> OutputVolumes:
+        return (
+            OutputVolumes(self.speaker, volume)
+            if output == "bluetooth"
+            else OutputVolumes(volume, self.bluetooth)
+        )
+
+
+def _read_volume_file() -> dict:
+    try:
+        values = json.loads(state_path().with_name("volume.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return values if isinstance(values, dict) else {}
+
+
+def _volume_from_data(values: object) -> VolumeState | None:
+    if not isinstance(values, dict):
+        return None
+    percent = values.get("percent")
+    muted = values.get("muted")
+    if type(percent) is not int or not 0 <= percent <= 100 or not isinstance(muted, bool):
+        return None
+    return VolumeState(percent, muted)
+
+
+def load_saved_volume() -> VolumeState | None:
+    return _volume_from_data(_read_volume_file())
+
+
+def load_bluetooth_volume(speaker: VolumeState) -> VolumeState:
+    return _volume_from_data(_read_volume_file().get("bluetooth")) or VolumeState(
+        min(speaker.percent, 10),
+        speaker.muted,
+    )
+
+
+def save_output_volumes(profiles: OutputVolumes) -> None:
+    write_json_atomically(
+        state_path().with_name("volume.json"),
+        {**asdict(profiles.speaker), "bluetooth": asdict(profiles.bluetooth)},
+    )
 
 
 def state_path() -> Path:

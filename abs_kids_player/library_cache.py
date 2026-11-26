@@ -3,24 +3,50 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from functools import lru_cache
 from pathlib import Path
 
 from .config import AppConfig
-from .models import Book
-from .storage import ensure_storage_directory, finalize_storage_file
+from .models import Book, SeriesMembership
+from .storage import write_json_atomically
 
 
 LIBRARY_CACHE_PATH = Path.home() / ".local" / "state" / "abs-kids-player" / "library-cache.json"
 LIBRARY_CACHE_VERSION = 1
 
 
-def load_cached_books(config: AppConfig) -> list[Book]:
+def _cached_books(config: AppConfig) -> list[Book]:
     if not config.is_ready:
         return []
 
+    path = library_cache_path()
     try:
-        payload = json.loads(library_cache_path().read_text(encoding="utf-8"))
+        stat = path.stat()
+        return _read_library_cache(
+            path, config_cache_key(config), (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        )
+    except (OSError, ValueError):
+        return []
+
+
+def load_cached_books(config: AppConfig) -> list[Book]:
+    # Browsing overlays current playback progress on these copies.
+    return [replace(book) for book in _cached_books(config)]
+
+
+def cached_download_progress(config: AppConfig, downloaded: Book) -> tuple[float, int]:
+    """Return the selected book's catalogue progress, falling back to its download manifest."""
+    for book in _cached_books(config):
+        if book.id == downloaded.id and book.progress_updated_at >= downloaded.progress_updated_at:
+            return book.current_time, book.progress_updated_at
+    return downloaded.current_time, downloaded.progress_updated_at
+
+
+@lru_cache(maxsize=4)
+def _read_library_cache(path: Path, key: str, revision: tuple[int, int, int]) -> list[Book]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
 
@@ -28,7 +54,7 @@ def load_cached_books(config: AppConfig) -> list[Book]:
         return []
     if payload.get("version") != LIBRARY_CACHE_VERSION:
         return []
-    if payload.get("config_key") != config_cache_key(config):
+    if payload.get("config_key") != key:
         return []
 
     books: list[Book] = []
@@ -48,6 +74,18 @@ def load_cached_books(config: AppConfig) -> list[Book]:
                     series_name=str(value.get("series_name", "")),
                     series_sequence=str(value.get("series_sequence", "")),
                     series_total=int(value.get("series_total", 0)),
+                    series_memberships=tuple(
+                        SeriesMembership(**membership)
+                        for membership in value.get("series_memberships", [])
+                        if isinstance(membership, dict)
+                    ),
+                    progress_updated_at=int(value.get("progress_updated_at", 0)),
+                    is_finished=bool(value.get("is_finished", False)),
+                    pinned_position=value.get("pinned_position"),
+                    episode_id=str(value.get("episode_id") or ""),
+                    podcast_title=str(value.get("podcast_title") or ""),
+                    source_item_id=str(value.get("source_item_id") or ""),
+                    narrator=str(value.get("narrator") or ""),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -55,12 +93,11 @@ def load_cached_books(config: AppConfig) -> list[Book]:
     return books
 
 
-def save_cached_books(config: AppConfig, books: list[Book]) -> None:
+def save_cached_books(config: AppConfig, books: list[Book]) -> bool:
     if not config.is_ready:
-        return
+        return False
 
     path = library_cache_path()
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
     payload = {
         "version": LIBRARY_CACHE_VERSION,
         "config_key": config_cache_key(config),
@@ -75,18 +112,24 @@ def save_cached_books(config: AppConfig, books: list[Book]) -> None:
                 "series_name": book.series_name,
                 "series_sequence": book.series_sequence,
                 "series_total": book.series_total,
+                "series_memberships": [asdict(member) for member in book.series_memberships],
+                "progress_updated_at": book.progress_updated_at,
+                "is_finished": book.is_finished,
+                "pinned_position": book.pinned_position,
+                "episode_id": book.episode_id,
+                "podcast_title": book.podcast_title,
+                "source_item_id": book.source_item_id,
+                "narrator": book.narrator,
             }
             for book in books
         ],
     }
     try:
-        ensure_storage_directory(path.parent)
-        temporary_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-        finalize_storage_file(temporary_path)
-        temporary_path.replace(path)
-        finalize_storage_file(path)
+        write_json_atomically(path, payload, compact=True)
     except OSError as error:
         print(f"Library cache could not be saved: {error}")
+        return False
+    return True
 
 
 def clear_cached_books() -> None:
@@ -103,6 +146,8 @@ def config_cache_key(config: AppConfig) -> str:
         "username": config.username,
         "podcasts": [asdict(podcast) for podcast in config.podcasts],
     }
+    if config.pinned_shelf:
+        identity["pinned_shelf"] = config.pinned_shelf
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
