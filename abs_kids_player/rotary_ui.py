@@ -1,20 +1,40 @@
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Union
 
-from .config import LIBRARY_SORT_AUTHOR, LIBRARY_SORT_TITLE, valid_library_sort_mode
+from .bluetooth_picker import SpeakerPicker
+from .bookmarks import Bookmark
+from .config import DEFAULT_PREFER_DOWNLOADED, LIBRARY_SORT_TITLE, valid_library_sort_mode
+from .display_frames import (
+    MORE_ACTION_LABEL,
+    BluetoothMenuFrame,
+    ChapterConfirmFrame,
+    DisplayFrame,
+    HomeFrame,
+    PlayingFrame,
+    ResumeChoiceFrame,
+    SleepConfirmFrame,
+    StartupResumeFrame,
+    TwoLineFrame,
+    VolumeFrame,
+)
+from .library import book_section_letter, next_series_book
+from .library_navigation import JUMP_TO_LETTER, LibraryBrowser
 from .models import Book, Chapter, PlaybackSession
+from .player_control import WebPlayerCommand
 from .player_state import LastPlaybackState
-
-
-BLUETOOTH_DEVICE_NAME_MAX_CHARS = 20
+from .volume_controls import stepped_volume_percent
 
 
 class Screen(str, Enum):
     LIBRARY = "library"
+    BROWSE = "browse"
+    LISTENING = "listening"
+    CHAPTER_PICKER = "chapter_picker"
+    BOOKMARK_PICKER = "bookmark_picker"
+    FINISH_CONFIRM = "finish_confirm"
+    BEDTIME = "bedtime"
     STARTUP_RESUME = "startup_resume"
     RESUME_CHOICE = "resume_choice"
     PLAYING = "playing"
@@ -26,18 +46,24 @@ class Screen(str, Enum):
 
 class CommandType(str, Enum):
     PLAY_BOOK = "play_book"
+    RETRY_LIBRARY = "retry_library"
     PAUSE_PLAYBACK = "pause_playback"
+    END_SELECTION = "end_selection"
     TOGGLE_PLAYBACK = "toggle_playback"
     SEEK_CHAPTER = "seek_chapter"
+    SEEK_POSITION = "seek_position"
+    UNDO_JUMP = "undo_jump"
+    SAVE_BOOKMARK = "save_bookmark"
+    LOAD_BOOKMARKS = "load_bookmarks"
+    MARK_FINISHED = "mark_finished"
+    SET_BEDTIME = "set_bedtime"
+    LOAD_PODCASTS = "load_podcasts"
     HOME = "home"
     VOLUME_DELTA = "volume_delta"
     TOGGLE_MUTE = "toggle_mute"
     SHOW_IP = "show_ip"
     CLEAR_LAST_PLAYBACK = "clear_last_playback"
     SET_BLUETOOTH_ENABLED = "set_bluetooth_enabled"
-    START_BLUETOOTH_SCAN = "start_bluetooth_scan"
-    PAIR_BLUETOOTH_DEVICE = "pair_bluetooth_device"
-    UNPAIR_BLUETOOTH_DEVICE = "unpair_bluetooth_device"
     CONFIRM_STILL_LISTENING = "confirm_still_listening"
 
 
@@ -52,257 +78,18 @@ class MenuCommand:
     volume_delta: int = 0
     display_seconds: int = 0
     bluetooth_enabled: bool = False
-    bluetooth_device_address: str = ""
-    bluetooth_device_name: str = ""
-
-
-@dataclass(frozen=True)
-class TwoLineFrame:
-    top: str
-    bottom: str
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-
-@dataclass(frozen=True)
-class HomeFrame:
-    title: str
-    author: str
-    series_position: str = ""
-    title_scroll_px: int = 0
-    title_scrolling: bool = False
-    section_letter: str = ""
-    section_letter_fill: int = 0
-    muted: bool = False
-    bluetooth_connected: bool = False
-    is_podcast: bool = False
-
-    @property
-    def top(self) -> str:
-        return self.title
-
-    @property
-    def bottom(self) -> str:
-        return author_line(self.author)
-
-
-@dataclass(frozen=True)
-class SplashFrame:
-    text: str
-
-    @property
-    def top(self) -> str:
-        return self.text
-
-    @property
-    def bottom(self) -> str:
-        return ""
-
-
-@dataclass(frozen=True)
-class ScreenSaverFrame:
-    frame_index: int
-    mode: str = "chapter"
-    words: tuple[str, ...] = ("chapter",)
-    clock_text: str = ""
-    brightness_percent: int = 15
-
-    @property
-    def top(self) -> str:
-        return "Screen saver"
-
-    @property
-    def bottom(self) -> str:
-        return ""
-
-
-@dataclass(frozen=True)
-class VolumeFrame:
-    percent: int
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-    @property
-    def top(self) -> str:
-        return "Muted" if self.is_muted else "Volume"
-
-    @property
-    def bottom(self) -> str:
-        return volume_bar(self.percent)
-
-    @property
-    def is_muted(self) -> bool:
-        return self.muted or self.percent <= 0
-
-
-@dataclass(frozen=True)
-class PlayingFrame:
-    chapter_text: str
-    remaining_text: str
-    actions: tuple[str, str, str, str]
-    selected_index: int
-    title_scroll_px: int = 0
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-    @property
-    def top(self) -> str:
-        return f"{self.chapter_text} {self.remaining_text}".strip()
-
-    @property
-    def bottom(self) -> str:
-        parts = list(self.actions)
-        parts[self.selected_index] = f"[{parts[self.selected_index]}]"
-        return " ".join(parts)
-
-
-@dataclass(frozen=True)
-class ChapterConfirmFrame:
-    direction: str
-    selected_index: int = 0
-    options: tuple[str, str] = ("Yes", "No")
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-    @property
-    def top(self) -> str:
-        return f"Are you sure you want to listen to the {self.direction} chapter?"
-
-    @property
-    def bottom(self) -> str:
-        parts = list(self.options)
-        parts[self.selected_index] = f"[{parts[self.selected_index]}]"
-        return " ".join(parts)
-
-
-@dataclass(frozen=True)
-class SleepConfirmFrame:
-    countdown_seconds: int
-    options: tuple[str, ...] = ("Yes",)
-    selected_index: int = 0
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-    @property
-    def top(self) -> str:
-        return f"Are you still listening? {max(0, self.countdown_seconds)}"
-
-    @property
-    def bottom(self) -> str:
-        return "[Yes]"
-
-
-@dataclass(frozen=True)
-class ResumeChoiceFrame:
-    title: str
-    selected_index: int = 0
-    options: tuple[str, ...] = ("Continue", "Start over")
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-    @property
-    def top(self) -> str:
-        return self.title
-
-    @property
-    def bottom(self) -> str:
-        parts = list(self.options)
-        parts[self.selected_index] = f"[{parts[self.selected_index]}]"
-        return " ".join(parts)
-
-
-@dataclass(frozen=True)
-class StartupResumeFrame:
-    title: str
-    selected_index: int = 0
-    options: tuple[str, str] = ("Continue", "Home")
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-    @property
-    def top(self) -> str:
-        return f"You were listening to {self.title}"
-
-    @property
-    def bottom(self) -> str:
-        parts = list(self.options)
-        parts[self.selected_index] = f"[{parts[self.selected_index]}]"
-        return " ".join(parts)
-
-
-@dataclass(frozen=True)
-class BluetoothMenuFrame:
-    enabled: bool
-    selected_index: int = 2
-    options: tuple[str, str, str] = ("Back", "Disable", "Pair")
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-    @property
-    def top(self) -> str:
-        return "Bluetooth On" if self.enabled else "Bluetooth Off"
-
-    @property
-    def bottom(self) -> str:
-        parts = list(self.options)
-        parts[self.selected_index] = f"[{parts[self.selected_index]}]"
-        return " ".join(parts)
-
-
-@dataclass(frozen=True)
-class BluetoothDevicesFrame:
-    device_name: str
-    selected_index: int
-    total_count: int
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-    @property
-    def top(self) -> str:
-        return "Bluetooth Devices"
-
-    @property
-    def bottom(self) -> str:
-        suffix = f" {self.selected_index + 1}/{self.total_count}" if self.total_count else ""
-        return f"{shorten_device_name(self.device_name)}{suffix}".strip()
-
-
-@dataclass(frozen=True)
-class WifiSetupFrame:
-    ssid: str
-    url: str
-    muted: bool = False
-    bluetooth_connected: bool = False
-
-    @property
-    def top(self) -> str:
-        return f"Connect to {self.ssid}"
-
-    @property
-    def bottom(self) -> str:
-        return f"Browse to {self.url}"
-
-
-DisplayFrame = Union[
-    TwoLineFrame,
-    HomeFrame,
-    SplashFrame,
-    ScreenSaverFrame,
-    VolumeFrame,
-    PlayingFrame,
-    ChapterConfirmFrame,
-    SleepConfirmFrame,
-    ResumeChoiceFrame,
-    StartupResumeFrame,
-    BluetoothMenuFrame,
-    BluetoothDevicesFrame,
-    WifiSetupFrame,
-]
+    selected_at: float | None = field(default=None, compare=False, repr=False)
+    episode_id: str = ""
+    timer_minutes: int = 0
+    local_only: bool = False
+    web_command: WebPlayerCommand | None = field(default=None, compare=False, repr=False)
+    selection_key: str = ""
 
 
 PLAYING_ACTIONS = ["Home", "Prev", "Play", "Next"]
 PLAYING_PLAY_INDEX = 2
-VOLUME_STEP_PERCENT = 5
+BEDTIME_OPTIONS = (("Back", None), ("15 minutes", 15), ("30 minutes", 30),
+                   ("End of chapter", -1), ("Cancel timer", 0))
 VOLUME_OVERLAY_SECONDS = 3
 PLAYING_TITLE_WIDTH = 18
 CHAPTER_CONFIRM_TIMEOUT_SECONDS = 5.0
@@ -310,7 +97,6 @@ HOME_RETURN_TIMEOUT_SECONDS = 5.0
 SECTION_LETTER_HOLD_SECONDS = 1.0
 SECTION_LETTER_FADE_SECONDS = 0.8
 SECTION_LETTER_MAX_FILL = 255
-IGNORED_TITLE_PREFIX_WORDS = {"a", "the"}
 POWER_OFF_RESUME_REWIND_SECONDS = 10.0
 BOOK_TITLE_SPEECH_DELAY_SECONDS = 0.45
 
@@ -326,11 +112,32 @@ class ApplianceMenu:
         self,
         books: list[Book] | None = None,
         library_sort_mode: str = LIBRARY_SORT_TITLE,
+        *,
+        browsing: bool = False,
     ) -> None:
         self.books = books or []
+        self.offline = False
+        self.prefer_downloaded = DEFAULT_PREFER_DOWNLOADED
+        self._index_root_books()
+        self.browsing = browsing
         self.library_sort_mode = valid_library_sort_mode(library_sort_mode)
+        self.browser = LibraryBrowser(self.library_sort_mode)
+        self.browse_selected = False
+        self.resume_from_browse = False
+        self.listening_index = 0
+        self.chapter_picker_index = 0
+        self.bookmark_index = 0
+        self.bookmarks: list[Bookmark] = []
+        self.bookmark_status = "Loading bookmarks"
+        self.bedtime_index = 0
+        self.skip_back_seconds = 15
+        self.skip_forward_seconds = 30
+        self.undo_position: float | None = None
+        self.selected_series = ""
+        self.next_book: Book | None = None
+        self.library_error: TwoLineFrame | None = None
         self.screen = Screen.LIBRARY
-        self.book_index = 0
+        self.book_index = self._root_indexes[0] if self._root_indexes else 0
         self.resume_choice_index = 0
         self.startup_resume_state: LastPlaybackState | None = None
         self.startup_resume_index = 0
@@ -344,9 +151,9 @@ class ApplianceMenu:
         self.bluetooth_connected = False
         self.bluetooth_index = 2
         self.bluetooth_return_screen = Screen.LIBRARY
-        self.bluetooth_devices: list[tuple[str, str]] = []
-        self.bluetooth_device_index = 0
+        self.speakers = SpeakerPicker()
         self.session: PlaybackSession | None = None
+        self.session_key = ""
         self.current_time = 0.0
         self.is_playing = False
         self.playing_action_index = PLAYING_PLAY_INDEX
@@ -360,18 +167,88 @@ class ApplianceMenu:
         self._section_letter_elapsed = 0.0
 
     def set_books(self, books: list[Book]) -> None:
+        selected_id = self.books[self.book_index].id if self.books else None
+        resume_open = self.screen == Screen.RESUME_CHOICE or (
+            self.screen in (Screen.BLUETOOTH, Screen.BLUETOOTH_DEVICES)
+            and self.bluetooth_return_screen == Screen.RESUME_CHOICE
+        )
+        choice = self.resume_options[self.resume_choice_index] if resume_open else None
         self.books = books
+        self._index_root_books()
+        self.browser.set_books(self._browse_books())
+        if self.screen == Screen.LISTENING:
+            self._find_next_book()
+        self.library_error = None
+        selected_index = next((index for index, book in enumerate(books) if book.id == selected_id), None)
+        if selected_index is not None:
+            self.book_index = selected_index
+            if self.screen == Screen.LIBRARY and self._root_indexes and self.book_index not in self._root_positions:
+                self.book_index = self._root_indexes[0]
+            if resume_open:
+                options = self.resume_options
+                self.resume_choice_index = options.index(choice) if choice in options else 0
+            return
+
         self.book_index = min(self.book_index, max(0, len(books) - 1))
-        if not books:
-            self.clear_section_letter()
-            self.screen = Screen.LIBRARY
+        if self._root_indexes and self.book_index not in self._root_positions:
+            self.book_index = self._root_indexes[0]
+        self.clear_section_letter()
+        if self.screen == Screen.RESUME_CHOICE or (not books and self.session is None and self.screen not in (Screen.BLUETOOTH, Screen.BLUETOOTH_DEVICES)):
+            self.screen = Screen.BROWSE if self.resume_from_browse and books else Screen.LIBRARY
+        if self.bluetooth_return_screen == Screen.RESUME_CHOICE:
+            self.bluetooth_return_screen = Screen.LIBRARY
+        if resume_open:
+            self.resume_choice_index = 0
+
+    def _index_root_books(self) -> None:
+        visible = {book.id for book in self._browse_books() if self.offline or not book.download_only}
+        self._root_indexes = [
+            index for index, book in enumerate(self.books) if book.id in visible and not book.episode_id
+        ]
+        self._root_positions = {index: position for position, index in enumerate(self._root_indexes)}
+
+    @property
+    def browse_tile_selected(self) -> bool:
+        return self.browse_selected or bool(self.browsing and self.books and not self._root_indexes)
+
+    def _browse_books(self) -> list[Book]:
+        if self.offline and (downloaded := [book for book in self.books if book.downloaded]):
+            return downloaded
+        return self.books
+
+    def set_offline(self, offline: bool) -> None:
+        if self.offline == offline:
+            return
+        self.offline = offline
+        self.browser.offline = offline
+        self._index_root_books()
+        self.browser.set_books(self._browse_books())
+        if self.offline and self.screen == Screen.STARTUP_RESUME and self.startup_resume_state:
+            downloads = {book.id for book in self.books if book.downloaded}
+            if downloads and self.startup_resume_state.book_id not in downloads:
+                self.set_startup_resume(None)
+                self.screen = Screen.LIBRARY
+        if self.screen == Screen.LIBRARY and self._root_indexes and self.book_index not in self._root_positions:
+            self.book_index = self._root_indexes[0]
+
+    def _find_next_book(self) -> None:
+        self.next_book = (
+            next_series_book(self.books, self.session.library_item_id, self.selected_series)
+            if self.session else None
+        )
 
     def set_library_sort_mode(self, mode: str) -> None:
         self.library_sort_mode = valid_library_sort_mode(mode)
+        self.browser.set_sort_mode(self.library_sort_mode)
         self.clear_section_letter()
 
     def reset_to_library(self) -> None:
+        self.browser = LibraryBrowser(self.library_sort_mode, offline=self.offline)
+        self.browse_selected = False
+        self.resume_from_browse = False
+        self.selected_series = ""
         self.session = None
+        self.session_key = ""
         self.current_time = 0.0
         self.is_playing = False
         self.book_index = min(self.book_index, max(0, len(self.books) - 1))
@@ -388,8 +265,11 @@ class ApplianceMenu:
         self.reset_title_scroll()
         self.clear_section_letter()
 
-    def set_session(self, session: PlaybackSession, is_playing: bool = True) -> None:
+    def set_session(self, session: PlaybackSession, is_playing: bool = True, *, session_key: str = "") -> None:
+        if self.session is None or (self.session.id, self.session.library_item_id) != (session.id, session.library_item_id):
+            self.undo_position = None
         self.session = session
+        self.session_key = session_key
         self.current_time = session.current_time
         self.is_playing = is_playing
         self.playing_action_index = PLAYING_PLAY_INDEX
@@ -401,6 +281,11 @@ class ApplianceMenu:
         self.startup_resume_index = 0
         if self.startup_resume_state is not None:
             self.screen = Screen.STARTUP_RESUME
+
+    def set_bookmarks(self, bookmarks: list[Bookmark] | None) -> None:
+        self.bookmarks = bookmarks or []
+        self.bookmark_index = 0
+        self.bookmark_status = "Bookmarks unavailable" if bookmarks is None else "No saved bookmarks"
 
     def update_playback(self, current_time: float, is_playing: bool) -> None:
         self.current_time = max(0, current_time)
@@ -419,8 +304,17 @@ class ApplianceMenu:
 
     def rotate_nav_once(self, direction: int) -> None:
         if self.screen == Screen.LIBRARY:
-            self.book_index = wrap_index(self.book_index + direction, len(self.books))
+            root = self._root_indexes
+            current = self._root_positions.get(self.book_index, 0)
+            index = len(root) if self.browse_selected else current
+            count = len(root) + int(self.browsing and bool(self.books))
+            index = wrap_index(index + direction, count)
+            self.browse_selected = bool(self.books) and index == len(root)
+            if not self.browse_selected and root:
+                self.book_index = root[index]
             self.show_section_letter()
+        elif self.screen == Screen.BROWSE:
+            self.browser.move(direction)
         elif self.screen == Screen.STARTUP_RESUME:
             self.startup_resume_index = clamp(self.startup_resume_index + direction, 0, 1)
         elif self.screen == Screen.RESUME_CHOICE:
@@ -433,8 +327,18 @@ class ApplianceMenu:
             self.playing_action_index = clamp(
                 self.playing_action_index + direction,
                 0,
-                len(PLAYING_ACTIONS) - 1,
+                len(self.playing_actions) - 1,
             )
+        elif self.screen == Screen.LISTENING:
+            self.listening_index = wrap_index(self.listening_index + direction, len(self.listening_options))
+        elif self.screen == Screen.CHAPTER_PICKER:
+            self.chapter_picker_index = wrap_index(self.chapter_picker_index + direction, len(self.chapters) + 1)
+        elif self.screen == Screen.BOOKMARK_PICKER:
+            self.bookmark_index = wrap_index(self.bookmark_index + direction, len(self.bookmarks) + 1)
+        elif self.screen == Screen.BEDTIME:
+            self.bedtime_index = wrap_index(self.bedtime_index + direction, len(BEDTIME_OPTIONS))
+        elif self.screen == Screen.FINISH_CONFIRM:
+            self.confirm_yes = direction > 0
         elif self.screen == Screen.CHAPTER_CONFIRM:
             selected_index = 0 if self.confirm_yes else 1
             selected_index = clamp(selected_index + direction, 0, 1)
@@ -443,17 +347,47 @@ class ApplianceMenu:
         elif self.screen == Screen.BLUETOOTH:
             self.bluetooth_index = clamp(self.bluetooth_index + direction, 0, 2)
         elif self.screen == Screen.BLUETOOTH_DEVICES:
-            self.bluetooth_device_index = clamp(
-                self.bluetooth_device_index + direction,
-                0,
-                max(0, len(self.bluetooth_device_options) - 1),
-            )
+            self.speakers.rotate(direction)
 
     def click_nav(self) -> list[MenuCommand]:
         if self.screen == Screen.LIBRARY:
-            if self.books:
+            if self.books and self.browse_tile_selected:
+                self.browser.open(self._browse_books())
+                self.screen = Screen.BROWSE
+            elif self.books:
+                self.resume_from_browse = False
+                self.selected_series = ""
                 self.resume_choice_index = self.default_resume_choice_index
                 self.screen = Screen.RESUME_CHOICE
+            elif self.library_error is not None:
+                return [MenuCommand(CommandType.RETRY_LIBRARY)]
+            return []
+
+        if self.screen == Screen.BROWSE:
+            loading_podcasts = self.browser.selected.key == "podcasts"
+            choice = self.browser.choose()
+            if loading_podcasts:
+                return [MenuCommand(CommandType.LOAD_PODCASTS)]
+            if not self.browser.pages:
+                self.screen = Screen.LIBRARY
+            if choice and choice.book:
+                book = choice.book
+                page = self.browser.pages[-1].key
+                self.book_index = next(index for index, entry in enumerate(self.books) if entry.id == book.id)
+                if page == JUMP_TO_LETTER:
+                    self.browser.close()
+                    self.browse_selected = False
+                    self.resume_from_browse = False
+                    self.selected_series = ""
+                    self.screen = Screen.LIBRARY
+                    self.show_section_letter()
+                    return []
+                self.selected_series = page.removeprefix("series/") if page.startswith("series/") else ""
+                self.resume_from_browse = True
+                self.resume_choice_index = self.default_resume_choice_index
+                self.screen = Screen.RESUME_CHOICE
+                if choice.play_now:
+                    return [self._book_command(book, start_over=False)]
             return []
 
         if self.screen == Screen.STARTUP_RESUME:
@@ -466,8 +400,10 @@ class ApplianceMenu:
                 MenuCommand(
                     CommandType.PLAY_BOOK,
                     book_id=state.book_id,
+                    episode_id=state.episode_id,
                     start_over=False,
                     resume_time=power_off_resume_time(state.current_time),
+                    local_only=self.offline,
                 )
             ]
 
@@ -475,18 +411,10 @@ class ApplianceMenu:
             book = self.books[self.book_index]
             choice = self.resume_options[self.resume_choice_index]
             if choice == "Home":
-                self.screen = Screen.LIBRARY
+                self.screen = Screen.BROWSE if self.resume_from_browse else Screen.LIBRARY
                 return [MenuCommand(CommandType.HOME)]
-            start_over = choice in ("Start", "Start over")
-            resume_time = 0 if start_over else book.current_time
-            return [
-                MenuCommand(
-                    CommandType.PLAY_BOOK,
-                    book_id=book.id,
-                    start_over=start_over,
-                    resume_time=resume_time,
-                )
-            ]
+            start_over = choice == "Start over"
+            return [self._book_command(book, start_over)]
 
         if self.screen == Screen.PLAYING:
             action = self.playing_action
@@ -499,7 +427,34 @@ class ApplianceMenu:
             if action == "Next":
                 self.queue_chapter_jump(1)
                 return []
+            if action == "More":
+                self.listening_index = 0
+                self._find_next_book()
+                self.screen = Screen.LISTENING
+                return []
             return [MenuCommand(CommandType.TOGGLE_PLAYBACK)]
+
+        if self.screen == Screen.LISTENING:
+            return self._choose_listening_action()
+        if self.screen == Screen.CHAPTER_PICKER:
+            if not self.chapter_picker_index:
+                self.screen = Screen.LISTENING
+                return []
+            self.screen = Screen.PLAYING
+            return [MenuCommand(CommandType.SEEK_POSITION, seek_time=self.chapters[self.chapter_picker_index - 1].start)]
+        if self.screen == Screen.BOOKMARK_PICKER:
+            if self.bookmark_index == 0:
+                self.screen = Screen.LISTENING
+                return []
+            self.screen = Screen.PLAYING
+            return [MenuCommand(CommandType.SEEK_POSITION, seek_time=self.bookmarks[self.bookmark_index - 1].time)]
+        if self.screen == Screen.FINISH_CONFIRM:
+            self.screen = Screen.PLAYING
+            return [MenuCommand(CommandType.MARK_FINISHED)] if self.confirm_yes else []
+        if self.screen == Screen.BEDTIME:
+            _, minutes = BEDTIME_OPTIONS[self.bedtime_index]
+            self.screen = Screen.LISTENING if minutes is None else Screen.PLAYING
+            return [] if minutes is None else [MenuCommand(CommandType.SET_BEDTIME, timer_minutes=minutes)]
 
         if self.screen == Screen.CHAPTER_CONFIRM:
             if not self.confirm_yes:
@@ -533,41 +488,21 @@ class ApplianceMenu:
                         bluetooth_enabled=self.bluetooth_enabled,
                     )
                 ]
-            if option == "Pair":
-                commands = []
-                if not self.bluetooth_enabled:
-                    self.bluetooth_enabled = True
-                    commands.append(
-                        MenuCommand(CommandType.SET_BLUETOOTH_ENABLED, bluetooth_enabled=True)
-                    )
-                commands.append(MenuCommand(CommandType.START_BLUETOOTH_SCAN))
-                return commands
-            if option == "Unpair":
-                return [MenuCommand(CommandType.UNPAIR_BLUETOOTH_DEVICE)]
+            if option == "Speakers":
+                self.screen = Screen.BLUETOOTH_DEVICES
+                self.speakers.open()
+                return []
 
         if self.screen == Screen.BLUETOOTH_DEVICES:
-            address, name = self.bluetooth_device_options[self.bluetooth_device_index]
-            if not address:
+            if not self.speakers.select():
                 self.screen = Screen.BLUETOOTH
-                return []
-            return [
-                MenuCommand(
-                    CommandType.PAIR_BLUETOOTH_DEVICE,
-                    bluetooth_device_address=address,
-                    bluetooth_device_name=name,
-                )
-            ]
 
         return []
 
     def rotate_volume(self, steps: int) -> list[MenuCommand]:
         if steps == 0:
             return []
-        self.volume_percent = clamp(
-            self.volume_percent + steps * VOLUME_STEP_PERCENT,
-            0,
-            100,
-        )
+        self.volume_percent = stepped_volume_percent(self.volume_percent, steps)
         self.volume_overlay_remaining = VOLUME_OVERLAY_SECONDS
         return [MenuCommand(CommandType.VOLUME_DELTA, volume_delta=steps)]
 
@@ -580,11 +515,15 @@ class ApplianceMenu:
     def hold_nav(self, bluetooth_enabled: bool = True, bluetooth_connected: bool = False) -> list[MenuCommand]:
         if self.screen == Screen.SLEEP_CONFIRM:
             return []
+        if self.screen in (Screen.BLUETOOTH, Screen.BLUETOOTH_DEVICES):
+            self.speakers.close()
+            self.screen = Screen.LIBRARY
+            return []
         self.open_bluetooth_menu(bluetooth_enabled, bluetooth_connected)
         return [MenuCommand(CommandType.PAUSE_PLAYBACK)]
 
     def open_bluetooth_menu(self, bluetooth_enabled: bool = True, bluetooth_connected: bool = False) -> None:
-        if self.screen != Screen.BLUETOOTH:
+        if self.screen not in (Screen.BLUETOOTH, Screen.BLUETOOTH_DEVICES):
             self.bluetooth_return_screen = self.screen
         self.bluetooth_enabled = bluetooth_enabled
         self.bluetooth_connected = bluetooth_connected
@@ -601,12 +540,8 @@ class ApplianceMenu:
         self.bluetooth_connected = connected
         self.bluetooth_index = min(self.bluetooth_index, len(self.bluetooth_options) - 1)
 
-    def set_bluetooth_devices(self, devices: list[tuple[str, str]]) -> None:
-        self.bluetooth_devices = devices
-        self.bluetooth_device_index = 1 if devices else 0
-        self.screen = Screen.BLUETOOTH_DEVICES
-
     def close_bluetooth_menu(self) -> None:
+        self.speakers.close()
         self.screen = self.bluetooth_return_screen
 
     def render(self) -> DisplayFrame:
@@ -615,7 +550,9 @@ class ApplianceMenu:
 
         if self.screen == Screen.LIBRARY:
             if not self.books:
-                return TwoLineFrame("No books", "Check connection")
+                return self.library_error or TwoLineFrame("No books", "Check library")
+            if self.browse_tile_selected:
+                return TwoLineFrame("Browse library", "Press to open")
             book = self.books[self.book_index]
             return HomeFrame(
                 book.display_title,
@@ -625,6 +562,23 @@ class ApplianceMenu:
                 section_letter_fill=self.section_letter_fill,
                 is_podcast=book_is_podcast(book),
             )
+
+        if self.screen == Screen.BROWSE:
+            return self.browser.render()
+        if self.screen == Screen.LISTENING:
+            return TwoLineFrame("More", self.selected_listening_option[1])
+        if self.screen == Screen.CHAPTER_PICKER:
+            title = self.chapters[self.chapter_picker_index - 1].title if self.chapter_picker_index else "Back"
+            return TwoLineFrame("Choose chapter", title)
+        if self.screen == Screen.BOOKMARK_PICKER:
+            if self.bookmark_index:
+                bookmark = self.bookmarks[self.bookmark_index - 1]
+                return TwoLineFrame(f"Bookmark {format_time(bookmark.time)}", bookmark.title or "Saved position")
+            return TwoLineFrame("Bookmarks" if self.bookmarks else self.bookmark_status, "Back")
+        if self.screen == Screen.FINISH_CONFIRM:
+            return TwoLineFrame("Mark this book finished?", "Yes" if self.confirm_yes else "No")
+        if self.screen == Screen.BEDTIME:
+            return TwoLineFrame("Sleep timer", BEDTIME_OPTIONS[self.bedtime_index][0])
 
         if self.screen == Screen.STARTUP_RESUME and self.startup_resume_state is not None:
             return StartupResumeFrame(
@@ -662,10 +616,7 @@ class ApplianceMenu:
             )
 
         if self.screen == Screen.BLUETOOTH_DEVICES:
-            options = self.bluetooth_device_options
-            index = min(self.bluetooth_device_index, max(0, len(options) - 1))
-            _address, name = options[index]
-            return BluetoothDevicesFrame(name, index, len(options))
+            return self.speakers.frame()
 
         return TwoLineFrame("Loading", "")
 
@@ -673,10 +624,18 @@ class ApplianceMenu:
         if self.screen == Screen.LIBRARY:
             if not self.books:
                 return None
+            if self.browse_tile_selected:
+                return SpokenSelection("Browse library")
             return SpokenSelection(
                 self.books[self.book_index].display_title,
                 delay_seconds=BOOK_TITLE_SPEECH_DELAY_SECONDS,
             )
+        if self.screen == Screen.BROWSE:
+            return SpokenSelection(self.browser.selected.label, BOOK_TITLE_SPEECH_DELAY_SECONDS)
+        if self.screen == Screen.LISTENING:
+            return SpokenSelection(self.selected_listening_option[1])
+        if self.screen in (Screen.CHAPTER_PICKER, Screen.BOOKMARK_PICKER, Screen.FINISH_CONFIRM, Screen.BEDTIME):
+            return SpokenSelection(self.render().bottom)
         if self.screen == Screen.STARTUP_RESUME and self.startup_resume_state is not None:
             return SpokenSelection(("Continue", "Home")[self.startup_resume_index])
         if self.screen == Screen.RESUME_CHOICE:
@@ -690,9 +649,7 @@ class ApplianceMenu:
         if self.screen == Screen.BLUETOOTH:
             return SpokenSelection(self.bluetooth_options[self.bluetooth_index])
         if self.screen == Screen.BLUETOOTH_DEVICES:
-            options = self.bluetooth_device_options
-            index = min(self.bluetooth_device_index, max(0, len(options) - 1))
-            return SpokenSelection(options[index][1])
+            return SpokenSelection(self.speakers.frame().device_name)
         return None
 
     @property
@@ -700,12 +657,8 @@ class ApplianceMenu:
         return (
             "Back",
             "Disable" if self.bluetooth_enabled else "Enable",
-            "Unpair" if self.bluetooth_connected else "Pair",
+            "Speakers",
         )
-
-    @property
-    def bluetooth_device_options(self) -> list[tuple[str, str]]:
-        return [("", "Back"), *self.bluetooth_devices]
 
     def render_volume(self) -> VolumeFrame:
         return VolumeFrame(self.volume_percent, muted=self.volume_percent <= 0)
@@ -817,15 +770,11 @@ class ApplianceMenu:
         self._title_scroll_subject = subject
 
     def show_section_letter(self) -> None:
-        if not self.books:
+        if not self.books or self.browse_tile_selected:
             self.clear_section_letter()
             return
         book = self.books[self.book_index]
-        self.section_letter = (
-            author_section_letter(book.author)
-            if self.library_sort_mode == LIBRARY_SORT_AUTHOR
-            else title_section_letter(book.display_title)
-        )
+        self.section_letter = book_section_letter(book, self.library_sort_mode)
         self.section_letter_fill = SECTION_LETTER_MAX_FILL
         self._section_letter_elapsed = 0.0
 
@@ -868,7 +817,10 @@ class ApplianceMenu:
 
     @property
     def playing_action(self) -> str:
-        return PLAYING_ACTIONS[self.playing_action_index]
+        if self.playing_action_index == PLAYING_PLAY_INDEX:
+            return "Play"
+        action = self.playing_actions[self.playing_action_index]
+        return "More" if action == MORE_ACTION_LABEL else action
 
     @property
     def action_row(self) -> str:
@@ -877,10 +829,68 @@ class ApplianceMenu:
         return " ".join(actions)
 
     @property
-    def playing_actions(self) -> tuple[str, str, str, str]:
+    def playing_actions(self) -> tuple[str, ...]:
         actions = PLAYING_ACTIONS.copy()
         actions[PLAYING_PLAY_INDEX] = "Pause" if self.is_playing else "Play"
+        if self.browsing:
+            actions.append(MORE_ACTION_LABEL)
         return tuple(actions)
+
+    @property
+    def listening_options(self) -> list[tuple[str, str]]:
+        choices = [
+            ("back", "Back"), ("skip_back", f"Back {self.skip_back_seconds}s"),
+            ("skip_forward", f"Forward {self.skip_forward_seconds}s"), ("chapters", "Choose chapter"),
+            ("bedtime", "Sleep timer"),
+        ]
+        if self.undo_position is not None:
+            choices.append(("undo", "Undo last jump"))
+        if self.session and not self.session.episode_id and not self.session.library_item_id.startswith("podcast:"):
+            choices.extend((("bookmarks", "Bookmarks"), ("bookmark", "Save bookmark")))
+        choices.extend((("stop", "Stop playback"), ("finish", "Mark finished")))
+        if self.next_book:
+            choices.append(("next_book", "Play next book"))
+        return choices
+
+    @property
+    def selected_listening_option(self) -> tuple[str, str]:
+        choices = self.listening_options
+        return choices[min(self.listening_index, len(choices) - 1)]
+
+    def _choose_listening_action(self) -> list[MenuCommand]:
+        choice, _ = self.selected_listening_option
+        if choice == "stop":
+            return [MenuCommand(CommandType.END_SELECTION, selection_key=self.session_key)]
+        if choice == "chapters":
+            self.chapter_picker_index = self.current_chapter_index + 1 if self.chapters else 0
+            self.screen = Screen.CHAPTER_PICKER
+            return []
+        if choice == "bookmarks":
+            self.bookmarks = []
+            self.bookmark_index = 0
+            self.bookmark_status = "Loading bookmarks"
+            self.screen = Screen.BOOKMARK_PICKER
+            return [MenuCommand(CommandType.LOAD_BOOKMARKS)]
+        if choice == "finish":
+            self.confirm_yes = False
+            self.screen = Screen.FINISH_CONFIRM
+            return []
+        if choice == "bedtime":
+            self.bedtime_index = 0
+            self.screen = Screen.BEDTIME
+            return []
+        self.screen = Screen.PLAYING
+        if choice in ("skip_back", "skip_forward"):
+            offset = -self.skip_back_seconds if choice == "skip_back" else self.skip_forward_seconds
+            return [MenuCommand(CommandType.SEEK_POSITION, seek_time=self.current_time + offset)]
+        if choice == "undo":
+            return [MenuCommand(CommandType.UNDO_JUMP)]
+        if choice == "bookmark":
+            return [MenuCommand(CommandType.SAVE_BOOKMARK)]
+        if choice == "next_book" and self.next_book:
+            book = self.next_book
+            return [self._book_command(book, start_over=False)]
+        return []
 
     @property
     def playing_chapter_text(self) -> str:
@@ -899,13 +909,25 @@ class ApplianceMenu:
     def resume_options(self) -> tuple[str, ...]:
         if not self.books:
             return ("Home",)
-        if self.books[self.book_index].has_play_history:
+        book = self.books[self.book_index]
+        if book.has_play_history or book.finished:
             return ("Home", "Continue", "Start over")
         return ("Home", "Start")
 
     @property
     def default_resume_choice_index(self) -> int:
         return 1 if len(self.resume_options) > 1 else 0
+
+    def _book_command(self, book: Book, start_over: bool) -> MenuCommand:
+        downloaded_page = self.resume_from_browse and self.browser.pages and self.browser.pages[-1].key == "downloaded"
+        return MenuCommand(
+            CommandType.PLAY_BOOK,
+            book_id=book.source_item_id or book.id,
+            episode_id=book.episode_id,
+            start_over=start_over,
+            resume_time=0 if start_over else book.current_time,
+            local_only=self.offline or bool(downloaded_page),
+        )
 
 
 def wrap_index(index: int, count: int) -> int:
@@ -918,88 +940,12 @@ def clamp(value: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), maximum)
 
 
-def volume_bar(percent: int, width: int = 12) -> str:
-    percent = clamp(percent, 0, 100)
-    filled = round((percent / 100) * width)
-    return "[" + "#" * filled + "-" * (width - filled) + "]"
-
-
-def author_line(author: str) -> str:
-    author = author.strip()
-    return f"By {author}" if author else ""
-
-
 def spoken_playing_action(action: str) -> str:
     return {
         "Prev": "Previous chapter",
         "Next": "Next chapter",
+        MORE_ACTION_LABEL: "More",
     }.get(action, action)
-
-
-def shorten_device_name(name: str, max_chars: int = BLUETOOTH_DEVICE_NAME_MAX_CHARS) -> str:
-    clean = " ".join(name.split())
-    if len(clean) <= max_chars:
-        return clean
-    return clean[: max(0, max_chars - 3)].rstrip() + "..."
-
-
-def title_section_letter(title: str) -> str:
-    words = title_words(title)
-    for word in words:
-        if word.lower() not in IGNORED_TITLE_PREFIX_WORDS:
-            return section_letter_for_word(word)
-    if words:
-        return section_letter_for_word(words[0])
-    return "#"
-
-
-def title_sort_text(title: str) -> str:
-    words = title_words(title)
-    sortable_words = list(words)
-    while sortable_words and sortable_words[0].lower() in IGNORED_TITLE_PREFIX_WORDS:
-        sortable_words.pop(0)
-    if not sortable_words:
-        sortable_words = words
-    return " ".join(sortable_words).casefold()
-
-
-def author_sort_text(author: str) -> str:
-    clean_author = " ".join(author.split())
-    if not clean_author:
-        return ""
-    primary_author = re.split(r"\s*(?:,|;|&|\band\b)\s*", clean_author, maxsplit=1, flags=re.IGNORECASE)[0]
-    name_parts = primary_author.split()
-    if not name_parts:
-        return ""
-    last_name = name_parts[-1].strip(".,")
-    given_names = " ".join(name_parts[:-1])
-    return f"{last_name} {given_names}".strip().casefold()
-
-
-def author_section_letter(author: str) -> str:
-    sort_text = author_sort_text(author)
-    return section_letter_for_word(sort_text) if sort_text else "#"
-
-
-def title_words(title: str) -> list[str]:
-    words: list[str] = []
-    current: list[str] = []
-    for character in title.strip():
-        if character.isalnum():
-            current.append(character)
-        elif current:
-            words.append("".join(current))
-            current = []
-    if current:
-        words.append("".join(current))
-    return words
-
-
-def section_letter_for_word(word: str) -> str:
-    first = word[0]
-    if first.isdigit():
-        return "#"
-    return first.upper()
 
 
 def book_is_podcast(book: Book) -> bool:

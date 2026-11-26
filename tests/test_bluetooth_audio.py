@@ -8,8 +8,8 @@ from abs_kids_player.bluetooth_audio import (
     CommandResult,
     audio_candidates,
     bluetooth_powered,
-    connection_successful,
     connected_bluetooth_audio_device,
+    connection_successful,
     enrich_device_name,
     named_devices,
     pair_bluetooth_audio_device,
@@ -183,20 +183,16 @@ class BluetoothAudioTest(unittest.TestCase):
 
         self.assertEqual(device, BluetoothDevice("22:33:44:55:66:77", "Kitchen Speaker"))
 
-    def test_pair_bluetooth_audio_device_scans_pairs_trusts_and_connects(self) -> None:
+    def test_bulk_pair_uses_the_same_verified_audio_path_as_the_picker(self) -> None:
         runner = FakeBluetoothctl()
-
-        result = pair_bluetooth_audio_device(
-            scan_seconds=0.1,
-            runner=runner,
-            scanner=lambda _seconds, _runner: [BluetoothDevice("AA:BB:CC:DD:EE:FF", "Test Headphones")],
-        )
-
+        with patch("abs_kids_player.bluetooth_connection.connect_speaker") as connect:
+            result = pair_bluetooth_audio_device(
+                scan_seconds=0.1, runner=runner,
+                scanner=lambda _seconds, _runner: [BluetoothDevice("AA:BB:CC:DD:EE:FF", "Test Headphones")],
+            )
         self.assertTrue(result.success)
+        self.assertEqual(connect.call_args.args[0].address, result.device_address)
         self.assertEqual(result.device_name, "Test Headphones")
-        self.assertIn(("pair", "AA:BB:CC:DD:EE:FF"), runner.calls)
-        self.assertIn(("trust", "AA:BB:CC:DD:EE:FF"), runner.calls)
-        self.assertIn(("connect", "AA:BB:CC:DD:EE:FF"), runner.calls)
 
     def test_scan_bluetooth_devices_returns_devices_without_pairing(self) -> None:
         runner = FakeBluetoothctl()
@@ -270,51 +266,12 @@ class BluetoothAudioTest(unittest.TestCase):
             ),
         )
 
-    def test_pair_bluetooth_device_pairs_selected_device(self) -> None:
-        runner = FakeBluetoothctl()
-
-        result = pair_bluetooth_device(BluetoothDevice("AA:BB:CC:DD:EE:FF", "Test Speaker"), runner)
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.device_name, "Test Speaker")
-        self.assertIn(("pair", "AA:BB:CC:DD:EE:FF"), runner.calls)
-
-    def test_pair_bluetooth_device_still_tries_connect_when_pair_fails(self) -> None:
-        class ConnectAfterPairFailure(FakeBluetoothctl):
-            def __call__(self, args, timeout: float) -> CommandResult:
-                if tuple(args) == ("pair", "AA:BB:CC:DD:EE:FF"):
-                    self.calls.append(tuple(args))
-                    return CommandResult(1, "Failed to pair")
-                return super().__call__(args, timeout)
-
-        runner = ConnectAfterPairFailure()
-
-        result = pair_bluetooth_device(BluetoothDevice("AA:BB:CC:DD:EE:FF", "Test Speaker"), runner)
-
-        self.assertTrue(result.success)
-        self.assertIn(("connect", "AA:BB:CC:DD:EE:FF"), runner.calls)
-
-    def test_pair_bluetooth_device_retries_connect(self) -> None:
-        class ConnectOnSecondAttempt(FakeBluetoothctl):
-            def __init__(self) -> None:
-                super().__init__()
-                self.connect_attempts = 0
-
-            def __call__(self, args, timeout: float) -> CommandResult:
-                if tuple(args) == ("connect", "AA:BB:CC:DD:EE:FF"):
-                    self.calls.append(tuple(args))
-                    self.connect_attempts += 1
-                    if self.connect_attempts == 1:
-                        return CommandResult(1, "Connection failed")
-                    return CommandResult(0, "Connection successful")
-                return super().__call__(args, timeout)
-
-        runner = ConnectOnSecondAttempt()
-
-        result = pair_bluetooth_device(BluetoothDevice("AA:BB:CC:DD:EE:FF", "Test Speaker"), runner)
-
-        self.assertTrue(result.success)
-        self.assertEqual(runner.connect_attempts, 2)
+    def test_synchronous_pair_also_preserves_the_failed_stage(self) -> None:
+        from abs_kids_player.bluetooth_speakers import SpeakerError
+        with patch("abs_kids_player.bluetooth_connection.connect_speaker", side_effect=SpeakerError("Trust", "Denied")):
+            result = pair_bluetooth_device(BluetoothDevice("AA:BB:CC:DD:EE:FF", "Test Speaker"), FakeBluetoothctl())
+        self.assertFalse(result.success)
+        self.assertEqual(result.message, "Trust failed")
 
     def test_scan_for_devices_keeps_scanning_until_audio_device_is_found(self) -> None:
         runner = FakeBluetoothctl()

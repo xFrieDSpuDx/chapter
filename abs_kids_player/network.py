@@ -3,7 +3,7 @@ from __future__ import annotations
 import socket
 import subprocess
 
-from .rotary_ui import TwoLineFrame, WifiSetupFrame
+from .display_frames import TwoLineFrame, WifiSetupFrame
 from .wifi import SETUP_HOTSPOT_SSID, SETUP_HOTSPOT_URL
 
 
@@ -46,6 +46,13 @@ def ip_address_frame(ip_address: str | None = None, port: int | None = None) -> 
         return TwoLineFrame("Setup address", "IP unavailable")
     url = f"http://{ip_address}" if port in (None, 80) else f"http://{ip_address}:{port}"
     return TwoLineFrame("Setup address", url)
+
+
+def setup_address_frame(lan_ip: str | None = None) -> TwoLineFrame:
+    ip = lan_ip or get_lan_ip()
+    if ip == "IP unavailable":
+        return TwoLineFrame("Wi-Fi connected", "Open setup page")
+    return TwoLineFrame("Setup address", f"http://{ip}")
 
 
 def wifi_setup_frame(

@@ -11,6 +11,22 @@ permissions:
   contents: read
 
 jobs:
+  playback-speed:
+    name: Native GStreamer playback speed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GStreamer for the system Python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-gst-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+      - name: Verify speed changes and resume through the audio filter
+        env:
+          CHAPTER_REQUIRE_GSTREAMER: "1"
+          PYTHONPATH: tests
+        run: /usr/bin/python3 -B -m unittest -v test_gstreamer_speed.NativeSpeedTest.test_rate_changes_and_resume_reach_the_audio_filter
+
   test:
     name: Tests and installer simulation
     runs-on: ubuntu-24.04
@@ -25,17 +41,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run Python tests
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 -m unittest discover -s tests
-
-      - name: Check Python and shell syntax
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
+      - name: Check Python, shell and the Pi installer
         run: |
-          python3 -m compileall -q abs_kids_player tests
-          bash -n scripts/install-raspberry-pi.sh tests/mock_raspberry_pi_install.sh tests/fixtures/mock-install-command
+          python3 -m pip install -r requirements-dev.txt
+          bash scripts/check.sh
 
-      - name: Simulate a clean Raspberry Pi OS Lite install
-        run: tests/mock_raspberry_pi_install.sh
+      - name: Set up Node for browser tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Exercise the browser player
+        run: |
+          npm install --prefix "$RUNNER_TEMP/chapter-browser" --no-audit --no-fund playwright@1.62.1 axe-core@4.12.1
+          "$RUNNER_TEMP/chapter-browser/node_modules/.bin/playwright" install --with-deps --only-shell chromium
+          NODE_PATH="$RUNNER_TEMP/chapter-browser/node_modules" node --test tests/browser/*.test.cjs

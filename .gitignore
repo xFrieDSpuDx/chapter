@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .DS_Store
 chapter-player-animated-*.jpg
+.venv/
+.ruff_cache/

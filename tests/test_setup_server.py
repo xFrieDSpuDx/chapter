@@ -1,46 +1,42 @@
 from __future__ import annotations
 
 import io
+import os
 import re
+import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from abs_kids_player import __version__
+from abs_kids_player.bluetooth_audio import BluetoothDevice
 from abs_kids_player.config import (
+    CLOCK_FORMAT_24_HOUR,
     LIBRARY_SORT_AUTHOR,
     LIBRARY_SORT_TITLE,
     SCREEN_SAVER_BOOKS,
-    SCREEN_SAVER_CLOCK,
     AppConfig,
     PodcastConfig,
 )
-from abs_kids_player.bluetooth_audio import BluetoothDevice
+from abs_kids_player.config import (
+    load_config as read_settings,
+)
+from abs_kids_player.config import (
+    save_config as write_settings,
+)
+from abs_kids_player.connection_health import ConnectionHealth, ConnectionMonitor, ConnectionState
 from abs_kids_player.player_control import WebPlayerStatus
+from abs_kids_player.setup_http import MAX_POST_BODY_BYTES
 from abs_kids_player.setup_server import (
-    PAGE,
-    MAX_POST_BODY_BYTES,
     SYSTEM_ACTION_DELAY_SECONDS,
     WIFI_CHANGE_DELAY_SECONDS,
-    audiobookshelf_status,
+    SetupHandler,
     bluetooth_status,
     login_and_refresh_player,
     login_username,
-    player_status_event_signature,
-    player_status_payload,
-    player_status_sse,
-    render_health_page,
-    render_podcasts_card,
-    render_player_status_value,
-    render_system_card,
-    render_settings_card,
-    render_status_panel,
-    render_wifi_card,
     restore_device_defaults,
-    schedule_software_update,
-    schedule_system_reboot,
-    schedule_system_reset,
-    schedule_wifi_forget,
     save_click_setting,
     save_library_sort_setting,
     save_playback_speed_setting,
@@ -48,10 +44,18 @@ from abs_kids_player.setup_server import (
     save_screen_saver_setting,
     save_sleep_timer_setting,
     save_spoken_navigation_setting,
-    saved_username,
-    SetupHandler,
+    schedule_software_update,
+    schedule_system_reboot,
+    schedule_system_reset,
+    schedule_wifi_forget,
 )
-from abs_kids_player.wifi import SETUP_HOTSPOT_SSID, WifiStatus
+from abs_kids_player.software_update import SoftwareUpdateState
+from abs_kids_player.web_player_events import (
+    player_status_event_signature,
+    player_status_payload,
+    player_status_sse,
+)
+from abs_kids_player.wifi import WifiStatus
 
 
 class FakeAudiobookshelfClient:
@@ -73,61 +77,29 @@ class FakeAudiobookshelfClient:
 
 
 class SetupServerTest(unittest.TestCase):
-    def test_health_page_shows_wifi_and_audiobookshelf_success(self) -> None:
-        html = render_health_page(
-            WifiStatus(connected=True, ssid="Chapter WiFi"),
-            (True, "Logged in to https://books.example.com as chapter"),
-        )
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.dict(os.environ, {"ABS_KIDS_PLAYER_CONFIG_PATH": directory + "/config.json"}))
 
-        self.assertNotIn("Setup Server", html)
-        self.assertIn("Connected to <strong>Chapter WiFi</strong>", html)
-        self.assertIn("Logged in to <strong>https://books.example.com</strong> as <strong>chapter</strong>", html)
-        self.assertIn(f"<strong>v{__version__}</strong>", html)
+    def test_player_fetch_returns_a_receipt_that_can_be_queried(self) -> None:
+        body = b"action=pause"
+        handler = object.__new__(SetupHandler)
+        handler.headers = {"Content-Length": str(len(body)), "X-Requested-With": "fetch"}
+        handler.rfile = io.BytesIO(body)
+        handler.send_json = Mock()
+        with patch("abs_kids_player.setup_server.queue_web_player_command",
+                   return_value=SimpleNamespace(id="command")):
+            handler.handle_player_post()
+        handler.send_json.assert_called_once_with({"id": "command", "outcome": "queued"}, status=202)
 
-    def test_health_page_shows_failures(self) -> None:
-        html = render_health_page(
-            WifiStatus(connected=False, message="Not connected"),
-            (False, "Not configured"),
-        )
-
-        self.assertIn("Not connected", html)
-        self.assertIn("Not configured", html)
-
-    def test_status_panel_shows_same_status_on_main_page(self) -> None:
-        html = render_status_panel(
-            WifiStatus(connected=True, ssid="Chapter WiFi"),
-            (True, "Logged in to https://books.example.com as chapter"),
-            WebPlayerStatus(title="The Hobbit", current_time=60, duration=300, is_playing=True, volume_percent=45),
-            (True, "Connected to Playroom Speaker"),
-        )
-
-        self.assertNotIn("Setup Server", html)
-        self.assertIn("Connected to <strong>Chapter WiFi</strong>", html)
-        self.assertIn("Logged in to <strong>https://books.example.com</strong> as <strong>chapter</strong>", html)
-        self.assertIn("Bluetooth", html)
-        self.assertIn("Connected to <strong>Playroom Speaker</strong>", html)
-        self.assertNotIn("Software Version", html)
-        self.assertIn("Currently Playing", html)
-        self.assertIn("The Hobbit", html)
-        self.assertIn("data-now-playing-title", html)
-        self.assertIn("data-now-playing-meta", html)
-        self.assertIn("data-playback-form", html)
-        self.assertIn("data-playback-action", html)
-        self.assertIn("data-playback-button", html)
-        self.assertNotIn("data-live-source", html)
-        self.assertIn('name="action" value="pause"', html)
-        self.assertNotIn('name="action" value="play"', html)
-        self.assertIn('class="volume-icon"', html)
-        self.assertIn("&#128266;", html)
-        self.assertIn('data-volume-percent>45%</div>', html)
-        self.assertIn('data-volume-slider', html)
-        self.assertIn('name="volume" type="range"', html)
-        self.assertNotIn(">Set</button>", html)
-
-    def test_status_categories_use_full_width_rows(self) -> None:
-        self.assertIn("grid-template-columns: 1fr;", PAGE)
-        self.assertIn("grid-template-columns: minmax(140px, 180px) minmax(0, 1fr);", PAGE)
-        self.assertIn("overflow-wrap: anywhere;", PAGE)
+        handler.path = "/player/command?id=command"
+        with (
+            patch("abs_kids_player.setup_server.command_result", return_value="applied") as status,
+            patch("abs_kids_player.setup_server.time.time", return_value=120.5),
+        ):
+            handler.do_GET()
+        status.assert_called_once_with("command")
+        handler.send_json.assert_called_with({"outcome": "applied", "observedAt": 120.5})
 
     def test_saved_login_does_not_add_redundant_page_message(self) -> None:
         handler = object.__new__(SetupHandler)
@@ -143,27 +115,60 @@ class SetupServerTest(unittest.TestCase):
                 "abs_kids_player.setup_server.wifi_status",
                 return_value=WifiStatus(connected=True, ssid="Chapter WiFi"),
             ),
-            patch(
-                "abs_kids_player.setup_server.audiobookshelf_status",
-                return_value=(True, "Logged in to https://books.example.com as chapter"),
-            ),
+            patch("abs_kids_player.setup_server.connection_monitor") as monitor,
             patch("abs_kids_player.setup_server.load_web_player_status", return_value=WebPlayerStatus()),
             patch("abs_kids_player.setup_server.bluetooth_status", return_value=(False, "Not connected")),
         ):
+            monitor.status_for.return_value = ConnectionHealth(ConnectionState.CONNECTED, "chapter")
             handler.send_page()
 
         page = handler.wfile.getvalue().decode("utf-8")
         self.assertNotIn("This player already has an Audiobookshelf login saved.", page)
-        self.assertIn("Logged in to <strong>https://books.example.com</strong> as <strong>chapter</strong>", page)
+        self.assertIn("Signed in as chapter.", page)
 
-    def test_status_panel_shows_bluetooth_disconnected_by_default(self) -> None:
-        html = render_status_panel(
-            WifiStatus(connected=True, ssid="Chapter WiFi"),
-            (True, "Logged in to https://books.example.com as chapter"),
-        )
+    def test_admin_page_renders_while_audiobookshelf_verification_is_blocked(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
 
-        self.assertIn("Bluetooth", html)
-        self.assertIn("Not connected", html)
+        def slow_check(_config: AppConfig) -> ConnectionHealth:
+            started.set()
+            release.wait(timeout=2)
+            return ConnectionHealth(ConnectionState.CONNECTED, "chapter")
+
+        monitor = ConnectionMonitor(slow_check)
+        config = AppConfig(server_url="https://books.example.com", token="token", username="chapter")
+        handler = object.__new__(SetupHandler)
+        handler.send_html = Mock()
+
+        try:
+            with (
+                patch("abs_kids_player.setup_server.connection_monitor", monitor),
+                patch("abs_kids_player.setup_server.load_config", return_value=config),
+                patch("abs_kids_player.setup_server.wifi_status", return_value=WifiStatus(connected=False)),
+                patch("abs_kids_player.setup_server.load_web_player_status", return_value=WebPlayerStatus()),
+                patch("abs_kids_player.setup_server.bluetooth_status", return_value=(False, "Not connected")),
+            ):
+                handler.send_page()
+                self.assertTrue(started.wait(timeout=1))
+                page = handler.send_html.call_args.args[1]
+                self.assertIn("Checking connection", page)
+                self.assertNotIn("Library accessible", page)
+        finally:
+            release.set()
+
+    def test_audiobookshelf_endpoint_returns_the_latest_check(self) -> None:
+        handler = object.__new__(SetupHandler)
+        handler.path = "/status/audiobookshelf"
+        handler.send_html = Mock()
+        with (
+            patch("abs_kids_player.setup_server.load_config", return_value=AppConfig()),
+            patch("abs_kids_player.setup_server.connection_monitor") as monitor,
+        ):
+            monitor.status_for.return_value = ConnectionHealth(ConnectionState.SIGN_IN_REQUIRED)
+            handler.do_GET()
+
+        self.assertEqual(handler.send_html.call_args.args[0], 200)
+        self.assertIn("Sign in again from Connections.", handler.send_html.call_args.args[1])
 
     def test_bluetooth_status_reports_connected_device_name(self) -> None:
         with patch(
@@ -175,24 +180,6 @@ class SetupServerTest(unittest.TestCase):
     def test_bluetooth_status_reports_not_connected(self) -> None:
         with patch("abs_kids_player.setup_server.connected_bluetooth_audio_device", return_value=None):
             self.assertEqual(bluetooth_status(), (False, "Not connected"))
-
-    def test_player_status_value_shows_nothing_playing_without_session(self) -> None:
-        html = render_player_status_value(WebPlayerStatus())
-
-        self.assertIn("Nothing playing", html)
-        self.assertIn('data-has-session="0"', html)
-        self.assertIn('class="playback-form hidden"', html)
-        self.assertIn('class="volume-form hidden"', html)
-        self.assertIn('action="/player"', html)
-
-    def test_player_status_value_shows_play_button_when_paused(self) -> None:
-        html = render_player_status_value(
-            WebPlayerStatus(title="The Hobbit", current_time=60, duration=300, is_playing=False, volume_percent=45)
-        )
-
-        self.assertIn('name="action" value="play"', html)
-        self.assertIn(">Play</button>", html)
-        self.assertNotIn('name="action" value="pause"', html)
 
     def test_player_status_payload_reports_contextual_button_state(self) -> None:
         payload = player_status_payload(
@@ -234,68 +221,6 @@ class SetupServerTest(unittest.TestCase):
         self.assertEqual(player_status_event_signature(paused), player_status_event_signature(later))
         self.assertNotEqual(player_status_event_signature(paused), player_status_event_signature(playing))
 
-    def test_settings_card_toggles_control_click_sound(self) -> None:
-        enabled = render_settings_card(AppConfig(control_click_enabled=True))
-        disabled = render_settings_card(AppConfig(control_click_enabled=False))
-
-        self.assertIn("<h2 id=\"settings-heading\">Settings</h2>", enabled)
-        self.assertIn('class="settings-list"', enabled)
-        self.assertIn('class="settings-row"', enabled)
-        self.assertIn('class="setting-name">Control knob click sound</div>', enabled)
-        self.assertNotIn('class="setting-name">Control knob click sound</div>\n            <div class="setting-state">', enabled)
-        self.assertIn('class="toggle-button is-on"', enabled)
-        self.assertIn('aria-pressed="true"', enabled)
-        self.assertIn("Disable control knob click sound", enabled)
-        self.assertIn('name="enabled" value="0"', enabled)
-        self.assertIn('class="toggle-button"', disabled)
-        self.assertIn('aria-pressed="false"', disabled)
-        self.assertIn("Enable control knob click sound", disabled)
-        self.assertIn('name="enabled" value="1"', disabled)
-        self.assertIn('class="setting-name">Spoken navigation</div>', enabled)
-        self.assertIn('action="/settings/spoken-navigation"', enabled)
-        self.assertIn("Enable spoken navigation", enabled)
-        spoken_enabled = render_settings_card(AppConfig(spoken_navigation_enabled=True))
-        self.assertIn("Disable spoken navigation", spoken_enabled)
-        self.assertIn('class="setting-name">Library order</div>', enabled)
-        self.assertNotIn('class="setting-name">Library order</div>\n            <div class="setting-state">', enabled)
-        self.assertIn('action="/settings/library-order"', enabled)
-        self.assertIn('<option value="title" selected>Title</option>', enabled)
-
-        author_order = render_settings_card(AppConfig(library_sort_mode=LIBRARY_SORT_AUTHOR))
-        self.assertIn('<option value="author" selected>Author (last name)</option>', author_order)
-        self.assertIn('class="setting-name">Playback speed</div>', enabled)
-        self.assertIn('action="/settings/playback-speed"', enabled)
-        self.assertIn('<option value="1" selected>1x</option>', enabled)
-        faster_playback = render_settings_card(AppConfig(playback_speed=1.5))
-        self.assertIn('<option value="1.5" selected>1.5x</option>', faster_playback)
-        self.assertIn('<option value="2">2x</option>', faster_playback)
-        self.assertIn('class="setting-name">Screen saver</div>', enabled)
-        self.assertNotIn('class="setting-name">Screen saver</div>\n            <div class="setting-state">', enabled)
-        self.assertIn('action="/settings/screensaver"', enabled)
-        self.assertIn('aria-label="Screen saver dim level"', enabled)
-        self.assertIn('<option value="15" selected>15%</option>', enabled)
-        self.assertIn('<option value="chapter" selected>Chapter word</option>', enabled)
-
-        clock = render_settings_card(AppConfig(screen_saver_mode=SCREEN_SAVER_CLOCK, screen_saver_dim_percent=10))
-        self.assertIn('<option value="clock" selected>Digital clock</option>', clock)
-        self.assertIn('<option value="10" selected>10% (darkest)</option>', clock)
-
-        sleep_disabled = render_settings_card(AppConfig(sleep_timer_enabled=False, sleep_timer_minutes=45))
-        self.assertIn('class="setting-name">Sleep timer</div>', sleep_disabled)
-        self.assertNotIn('class="setting-name">Sleep timer</div>\n            <div class="setting-state">', sleep_disabled)
-        self.assertNotIn('aria-label="Sleep timer minutes"', sleep_disabled)
-        self.assertNotIn("minutes of listening", sleep_disabled)
-
-        sleep_enabled = render_settings_card(AppConfig(sleep_timer_enabled=True, sleep_timer_minutes=45))
-        self.assertIn('class="setting-name">Sleep timer</div>', sleep_enabled)
-        self.assertNotIn('class="setting-name">Sleep timer</div>\n            <div class="setting-state">', sleep_enabled)
-        self.assertIn('action="/settings/sleep"', sleep_enabled)
-        self.assertIn("Ask after", sleep_enabled)
-        self.assertIn('aria-label="Sleep timer minutes"', sleep_enabled)
-        self.assertIn('value="45"', sleep_enabled)
-        self.assertIn("minutes of listening", sleep_enabled)
-        self.assertNotIn('class="setting-name">Listening time</div>', sleep_enabled)
-
     def test_save_click_setting_preserves_login_config(self) -> None:
         podcasts = [PodcastConfig(url="https://podcasts.apple.com/us/podcast/example/id123", title="Example")]
         config = AppConfig(
@@ -308,11 +233,8 @@ class SetupServerTest(unittest.TestCase):
             podcasts=podcasts,
         )
 
-        with (
-            patch("abs_kids_player.setup_server.load_config", return_value=config),
-            patch("abs_kids_player.setup_server.save_config") as save_config,
-        ):
-            updated = save_click_setting(False)
+        write_settings(config)
+        updated = save_click_setting(False)
 
         self.assertEqual(updated.server_url, config.server_url)
         self.assertEqual(updated.token, config.token)
@@ -321,7 +243,7 @@ class SetupServerTest(unittest.TestCase):
         self.assertFalse(updated.control_click_enabled)
         self.assertEqual(updated.screen_saver_mode, SCREEN_SAVER_BOOKS)
         self.assertEqual(updated.podcasts, podcasts)
-        save_config.assert_called_once_with(updated)
+        self.assertEqual(read_settings(), updated)
 
     def test_save_spoken_navigation_setting_preserves_other_config(self) -> None:
         config = AppConfig(
@@ -331,16 +253,13 @@ class SetupServerTest(unittest.TestCase):
             control_click_enabled=False,
         )
 
-        with (
-            patch("abs_kids_player.setup_server.load_config", return_value=config),
-            patch("abs_kids_player.setup_server.save_config") as save_config,
-        ):
-            updated = save_spoken_navigation_setting(True)
+        write_settings(config)
+        updated = save_spoken_navigation_setting(True)
 
         self.assertTrue(updated.spoken_navigation_enabled)
         self.assertFalse(updated.control_click_enabled)
         self.assertEqual(updated.server_url, config.server_url)
-        save_config.assert_called_once_with(updated)
+        self.assertEqual(read_settings(), updated)
 
     def test_save_library_sort_setting_preserves_config_and_resorts_player(self) -> None:
         config = AppConfig(
@@ -350,9 +269,8 @@ class SetupServerTest(unittest.TestCase):
             library_sort_mode=LIBRARY_SORT_TITLE,
         )
 
+        write_settings(config)
         with (
-            patch("abs_kids_player.setup_server.load_config", return_value=config),
-            patch("abs_kids_player.setup_server.save_config") as save_config,
             patch("abs_kids_player.setup_server.queue_web_player_command") as queue_command,
         ):
             updated = save_library_sort_setting(LIBRARY_SORT_AUTHOR)
@@ -360,7 +278,7 @@ class SetupServerTest(unittest.TestCase):
         self.assertEqual(updated.library_sort_mode, LIBRARY_SORT_AUTHOR)
         self.assertEqual(updated.server_url, config.server_url)
         self.assertEqual(updated.token, config.token)
-        save_config.assert_called_once_with(updated)
+        self.assertEqual(read_settings(), updated)
         queue_command.assert_called_once_with("resort_library")
 
     def test_save_screen_saver_setting_preserves_login_config(self) -> None:
@@ -375,11 +293,10 @@ class SetupServerTest(unittest.TestCase):
             podcasts=podcasts,
         )
 
-        with (
-            patch("abs_kids_player.setup_server.load_config", return_value=config),
-            patch("abs_kids_player.setup_server.save_config") as save_config,
-        ):
-            updated = save_screen_saver_setting(SCREEN_SAVER_BOOKS, 10)
+        write_settings(config)
+        updated = save_screen_saver_setting(
+            SCREEN_SAVER_BOOKS, 10, clock_format=CLOCK_FORMAT_24_HOUR
+        )
 
         self.assertEqual(updated.server_url, config.server_url)
         self.assertEqual(updated.token, config.token)
@@ -388,8 +305,19 @@ class SetupServerTest(unittest.TestCase):
         self.assertFalse(updated.control_click_enabled)
         self.assertEqual(updated.screen_saver_mode, SCREEN_SAVER_BOOKS)
         self.assertEqual(updated.screen_saver_dim_percent, 10)
+        self.assertEqual(updated.screen_saver_clock_format, CLOCK_FORMAT_24_HOUR)
         self.assertEqual(updated.podcasts, podcasts)
-        save_config.assert_called_once_with(updated)
+        self.assertEqual(read_settings(), updated)
+
+    def test_partial_screen_saver_settings_preserve_dim_level_and_clock_format(self) -> None:
+        config = AppConfig(screen_saver_dim_percent=25, screen_saver_clock_format=CLOCK_FORMAT_24_HOUR)
+        write_settings(config)
+        updated = save_screen_saver_setting(SCREEN_SAVER_BOOKS)
+
+        self.assertEqual(updated.screen_saver_mode, SCREEN_SAVER_BOOKS)
+        self.assertEqual(updated.screen_saver_dim_percent, 25)
+        self.assertEqual(updated.screen_saver_clock_format, CLOCK_FORMAT_24_HOUR)
+        self.assertEqual(read_settings(), updated)
 
     def test_save_playback_speed_setting_preserves_other_config(self) -> None:
         config = AppConfig(
@@ -399,16 +327,13 @@ class SetupServerTest(unittest.TestCase):
             playback_speed=1.0,
         )
 
-        with (
-            patch("abs_kids_player.setup_server.load_config", return_value=config),
-            patch("abs_kids_player.setup_server.save_config") as save_config,
-        ):
-            updated = save_playback_speed_setting("1.5")
+        write_settings(config)
+        updated = save_playback_speed_setting("1.5")
 
         self.assertEqual(updated.playback_speed, 1.5)
         self.assertEqual(updated.server_url, config.server_url)
         self.assertEqual(updated.token, config.token)
-        save_config.assert_called_once_with(updated)
+        self.assertEqual(read_settings(), updated)
 
     def test_save_sleep_timer_setting_preserves_other_config(self) -> None:
         config = AppConfig(
@@ -420,41 +345,17 @@ class SetupServerTest(unittest.TestCase):
             sleep_timer_minutes=30,
         )
 
-        with (
-            patch("abs_kids_player.setup_server.load_config", return_value=config),
-            patch("abs_kids_player.setup_server.save_config") as save_config,
-        ):
-            enabled = save_sleep_timer_setting(enabled=True)
-            updated = save_sleep_timer_setting(minutes=45)
+        write_settings(config)
+        enabled = save_sleep_timer_setting(enabled=True)
+        updated = save_sleep_timer_setting(minutes=45)
 
         self.assertTrue(enabled.sleep_timer_enabled)
         self.assertEqual(enabled.sleep_timer_minutes, 30)
-        self.assertFalse(updated.sleep_timer_enabled)
+        self.assertTrue(updated.sleep_timer_enabled)
         self.assertEqual(updated.sleep_timer_minutes, 45)
         self.assertEqual(updated.server_url, config.server_url)
         self.assertEqual(updated.screen_saver_mode, SCREEN_SAVER_BOOKS)
-        self.assertEqual(save_config.call_count, 2)
-
-    def test_podcasts_card_shows_saved_podcasts_and_apple_instruction(self) -> None:
-        html = render_podcasts_card(
-            AppConfig(
-                podcasts=[
-                    PodcastConfig(
-                        url="https://podcasts.apple.com/us/podcast/yoto-daily/id1635154611",
-                        title="Yoto Daily",
-                        author="Yoto",
-                    )
-                ]
-            )
-        )
-
-        self.assertIn("<h2 id=\"podcasts-heading\">Podcasts</h2>", html)
-        self.assertIn("Paste the show link from podcasts.apple.com", html)
-        self.assertIn('action="/podcasts"', html)
-        self.assertIn('name="podcast_url"', html)
-        self.assertIn("Yoto Daily by Yoto", html)
-        self.assertIn("Add row", html)
-        self.assertIn("Save Podcasts", html)
+        self.assertEqual(read_settings(), updated)
 
     def test_save_podcast_settings_resolves_urls_preserves_login_and_refreshes_library(self) -> None:
         config = AppConfig(
@@ -472,10 +373,9 @@ class SetupServerTest(unittest.TestCase):
             book_id="podcast:apple:123",
         )
 
+        write_settings(config)
         with (
-            patch("abs_kids_player.setup_server.load_config", return_value=config),
             patch("abs_kids_player.setup_server.resolve_podcast_config", return_value=resolved) as resolve_podcast,
-            patch("abs_kids_player.setup_server.save_config") as save_config,
             patch("abs_kids_player.setup_server.queue_web_player_command") as queue_command,
         ):
             updated = save_podcast_settings(
@@ -490,7 +390,7 @@ class SetupServerTest(unittest.TestCase):
         self.assertEqual(updated.server_url, config.server_url)
         self.assertEqual(updated.username, config.username)
         self.assertEqual(updated.podcasts, [resolved])
-        save_config.assert_called_once_with(updated)
+        self.assertEqual(read_settings(), updated)
         queue_command.assert_called_once_with("refresh_library")
 
     def test_click_setting_post_redirects_home_after_save(self) -> None:
@@ -504,7 +404,7 @@ class SetupServerTest(unittest.TestCase):
             handler.handle_click_setting_post()
 
         save_setting.assert_called_once_with(False)
-        handler.redirect_home.assert_called_once_with()
+        handler.redirect_home.assert_called_once_with("settings")
 
     def test_spoken_navigation_setting_post_redirects_home_after_save(self) -> None:
         body = b"enabled=1"
@@ -517,7 +417,33 @@ class SetupServerTest(unittest.TestCase):
             handler.handle_spoken_navigation_setting_post()
 
         save_setting.assert_called_once_with(True)
-        handler.redirect_home.assert_called_once_with()
+        handler.redirect_home.assert_called_once_with("settings")
+
+    def test_feedback_level_posts_preserve_the_other_setting_and_enabled_switches(self) -> None:
+        initial = AppConfig(
+            control_click_enabled=False, spoken_navigation_enabled=True,
+            control_click_volume_percent=12, spoken_navigation_volume_percent=34,
+        )
+        for method, expected in (
+            ("handle_click_setting_post", (7, 34)),
+            ("handle_spoken_navigation_setting_post", (12, 7)),
+        ):
+            with self.subTest(method=method):
+                body = b"volume_percent=7"
+                handler = object.__new__(SetupHandler)
+                handler.headers = {"Content-Length": str(len(body))}
+                handler.rfile = io.BytesIO(body)
+                handler.redirect_home = Mock()
+                write_settings(initial)
+                getattr(handler, method)()
+                updated = read_settings()
+                self.assertEqual(
+                    (updated.control_click_volume_percent, updated.spoken_navigation_volume_percent),
+                    expected,
+                )
+                self.assertFalse(updated.control_click_enabled)
+                self.assertTrue(updated.spoken_navigation_enabled)
+                handler.redirect_home.assert_called_once_with("settings")
 
     def test_library_sort_setting_post_redirects_home_after_save(self) -> None:
         body = b"library_sort_mode=author"
@@ -530,10 +456,10 @@ class SetupServerTest(unittest.TestCase):
             handler.handle_library_sort_setting_post()
 
         save_setting.assert_called_once_with(LIBRARY_SORT_AUTHOR)
-        handler.redirect_home.assert_called_once_with()
+        handler.redirect_home.assert_called_once_with("settings", anchor="book-preferences")
 
     def test_screen_saver_setting_post_redirects_home_after_save(self) -> None:
-        body = b"screen_saver_mode=books&screen_saver_dim_percent=10"
+        body = b"screen_saver_mode=books&screen_saver_dim_percent=10&screen_saver_clock_format=24-hour"
         handler = object.__new__(SetupHandler)
         handler.headers = {"Content-Length": str(len(body))}
         handler.rfile = io.BytesIO(body)
@@ -542,8 +468,8 @@ class SetupServerTest(unittest.TestCase):
         with patch("abs_kids_player.setup_server.save_screen_saver_setting") as save_setting:
             handler.handle_screen_saver_setting_post()
 
-        save_setting.assert_called_once_with(SCREEN_SAVER_BOOKS, 10)
-        handler.redirect_home.assert_called_once_with()
+        save_setting.assert_called_once_with(SCREEN_SAVER_BOOKS, "10", clock_format=CLOCK_FORMAT_24_HOUR)
+        handler.redirect_home.assert_called_once_with("settings", anchor="screen-saver")
 
     def test_playback_speed_setting_post_redirects_home_after_save(self) -> None:
         body = b"playback_speed=2"
@@ -556,7 +482,7 @@ class SetupServerTest(unittest.TestCase):
             handler.handle_playback_speed_setting_post()
 
         save_setting.assert_called_once_with("2")
-        handler.redirect_home.assert_called_once_with()
+        handler.redirect_home.assert_called_once_with("settings", anchor="book-preferences")
 
     def test_sleep_timer_toggle_post_redirects_home_after_save(self) -> None:
         body = b"enabled=1"
@@ -569,7 +495,7 @@ class SetupServerTest(unittest.TestCase):
             handler.handle_sleep_setting_post()
 
         save_setting.assert_called_once_with(enabled=True)
-        handler.redirect_home.assert_called_once_with()
+        handler.redirect_home.assert_called_once_with("settings", anchor="night-mode")
 
     def test_sleep_timer_minutes_post_redirects_home_after_save(self) -> None:
         body = b"minutes=45"
@@ -582,7 +508,7 @@ class SetupServerTest(unittest.TestCase):
             handler.handle_sleep_setting_post()
 
         save_setting.assert_called_once_with(minutes=45)
-        handler.redirect_home.assert_called_once_with()
+        handler.redirect_home.assert_called_once_with("settings", anchor="night-mode")
 
     def test_podcasts_post_redirects_home_after_save(self) -> None:
         body = b"podcast_url=https%3A%2F%2Fpodcasts.apple.com%2Fus%2Fpodcast%2Fexample%2Fid123"
@@ -595,7 +521,7 @@ class SetupServerTest(unittest.TestCase):
             handler.handle_podcasts_post()
 
         save_podcasts.assert_called_once_with(["https://podcasts.apple.com/us/podcast/example/id123"])
-        handler.redirect_home.assert_called_once_with()
+        handler.redirect_home.assert_called_once_with("podcasts")
 
     def test_system_reboot_post_responds_before_scheduling_reboot(self) -> None:
         handler = object.__new__(SetupHandler)
@@ -610,9 +536,11 @@ class SetupServerTest(unittest.TestCase):
     def test_system_update_post_pauses_playback_and_schedules_update(self) -> None:
         handler = object.__new__(SetupHandler)
         handler.send_page = Mock()
+        handler.post_fields = Mock(return_value={"version": ["0.4.0"]})
 
         with (
             patch("abs_kids_player.setup_server.queue_web_player_command") as queue_command,
+            patch("abs_kids_player.setup_server.load_update_state", return_value=SoftwareUpdateState()),
             patch("abs_kids_player.setup_server.save_update_state") as save_state,
             patch("abs_kids_player.setup_server.schedule_software_update") as schedule_update,
         ):
@@ -621,10 +549,54 @@ class SetupServerTest(unittest.TestCase):
         queue_command.assert_called_once_with("pause")
         state = save_state.call_args.args[0]
         self.assertEqual(state.phase, "installing")
-        self.assertEqual(state.message, "Preparing the software update.")
+        self.assertEqual(state.target_version, "0.4.0")
+        self.assertEqual(state.message, "Preparing to install v0.4.0.")
         self.assertGreater(state.updated_at, 0)
         handler.send_page.assert_called_once()
         schedule_update.assert_called_once_with()
+
+    def test_system_update_requires_a_valid_reviewed_version(self) -> None:
+        handler = object.__new__(SetupHandler)
+        handler.send_request_error = Mock()
+        handler.post_fields = Mock(return_value={"version": ["main"]})
+        with (
+            patch("abs_kids_player.setup_server.load_update_state", return_value=SoftwareUpdateState()),
+            patch("abs_kids_player.setup_server.schedule_software_update") as schedule_update,
+        ):
+            handler.handle_system_update_post()
+        handler.send_request_error.assert_called_once_with(400, "Review the available release before installing it.")
+        schedule_update.assert_not_called()
+
+    def test_system_update_cannot_be_requested_again_during_verification(self) -> None:
+        handler = object.__new__(SetupHandler)
+        handler.send_request_error = Mock()
+        state = SoftwareUpdateState(phase="verifying", updated_at=time.time())
+        with (
+            patch("abs_kids_player.setup_server.load_update_state", return_value=state),
+            patch("abs_kids_player.setup_server.schedule_software_update") as schedule_update,
+        ):
+            handler.handle_system_update_post()
+        handler.send_request_error.assert_called_once_with(409, "A software update is already running.")
+        schedule_update.assert_not_called()
+
+    def test_permanent_local_package_reports_its_source_and_keeps_online_updates_off(self):
+        handler = object.__new__(SetupHandler)
+        handler.send_json, handler.send_request_error = Mock(), Mock()
+        with (
+            patch.dict(os.environ, {"CHAPTER_RELEASE_SOURCE": "local"}, clear=True),
+            patch("abs_kids_player.setup_server.schedule_software_update") as schedule_update,
+            patch("abs_kids_player.setup_server.update_status_payload") as update_status,
+        ):
+            handler.send_system_update_status_json()
+            handler.handle_system_update_post()
+        handler.send_json.assert_called_once_with({
+            "phase": "local", "updateAvailable": False, "message": "Installed from a local package.",
+        })
+        handler.send_request_error.assert_called_once_with(
+            409, "This release is installed locally. Use the local release installer."
+        )
+        schedule_update.assert_not_called()
+        update_status.assert_not_called()
 
     def test_system_update_status_get_returns_json_payload(self) -> None:
         handler = object.__new__(SetupHandler)
@@ -668,30 +640,6 @@ class SetupServerTest(unittest.TestCase):
         handler.send_header.assert_any_call("Content-Length", "0")
         handler.end_headers.assert_called_once_with()
 
-    def test_audiobookshelf_form_does_not_show_library_id(self) -> None:
-        self.assertNotIn("Library ID", PAGE)
-        self.assertNotIn("library_id", PAGE)
-
-    def test_admin_page_groups_controls_into_accessible_tabs(self) -> None:
-        self.assertIn("<title>Chapter Player</title>", PAGE)
-        self.assertIn("<h1>Chapter Player</h1>", PAGE)
-        self.assertIn('class="app-brand"', PAGE)
-        self.assertIn('class="app-logo" src="/assets/chapter-logo.png"', PAGE)
-        self.assertIn('width="84" height="63" alt=""', PAGE)
-        self.assertIn('<link rel="icon" type="image/png" href="/assets/chapter-logo.png">', PAGE)
-        self.assertNotIn("Administration", PAGE)
-        self.assertIn('role="tablist"', PAGE)
-        for tab_name in ("overview", "settings", "podcasts", "connections", "system"):
-            self.assertIn(f'data-tab-target="{tab_name}"', PAGE)
-            self.assertIn(f'data-tab-panel="{tab_name}"', PAGE)
-        self.assertIn('data-tab-target="system">System</button>', PAGE)
-        self.assertNotIn('data-tab-target="reset"', PAGE)
-        self.assertIn('aria-selected="true"', PAGE)
-        self.assertIn('window.localStorage.setItem(tabStorageKey, tabName)', PAGE)
-        self.assertIn('window.localStorage.getItem(tabStorageKey)', PAGE)
-        self.assertIn('event.key === "ArrowRight"', PAGE)
-        self.assertIn('event.key === "ArrowLeft"', PAGE)
-
     def test_rendered_admin_page_protects_every_post_form_with_csrf_token(self) -> None:
         handler = object.__new__(SetupHandler)
         handler.server = SimpleNamespace(csrf_token="test-csrf-token")
@@ -706,7 +654,6 @@ class SetupServerTest(unittest.TestCase):
                 "abs_kids_player.setup_server.wifi_status",
                 return_value=WifiStatus(connected=True, ssid="Chapter WiFi"),
             ),
-            patch("abs_kids_player.setup_server.audiobookshelf_status", return_value=(False, "Not configured")),
             patch("abs_kids_player.setup_server.load_web_player_status", return_value=WebPlayerStatus()),
             patch("abs_kids_player.setup_server.bluetooth_status", return_value=(False, "Not connected")),
         ):
@@ -718,7 +665,26 @@ class SetupServerTest(unittest.TestCase):
         for form in forms:
             self.assertIn('name="csrf_token" value="test-csrf-token"', form)
         self.assertIn('meta name="chapter-csrf-token" content="test-csrf-token"', page)
-        self.assertIn('fields["csrf_token"] = csrfToken', page)
+        self.assertIn('href="/settings/themes"', page)
+
+    def test_themes_page_offers_eight_palettes_with_taupe_and_gold_as_default(self) -> None:
+        handler = object.__new__(SetupHandler)
+        handler.path = "/settings/themes"
+        handler.send_html = Mock()
+        with patch("abs_kids_player.setup_server.owner_sessions.access") as access:
+            access.return_value.can_manage = True
+            handler.do_GET()
+
+        status, page = handler.send_html.call_args.args
+        self.assertEqual(status, 200)
+        self.assertIn('<html lang="en" data-palette="taupe-gold"', page)
+        self.assertIn('name="palette" value="taupe-gold" checked', page)
+        self.assertIn('href="/?tab=settings">All settings</a>', page)
+        self.assertEqual(page.count('type="radio" name="palette"'), 8)
+        for name in ("Taupe &amp; Gold", "Tangerine &amp; Charcoal", "Midnight Brass"):
+            self.assertIn(name, page)
+        for name in ("JH Taupe", "CompleteSeries Orange", "Rail Deck Signal"):
+            self.assertNotIn(name, page)
 
     def test_post_dispatch_accepts_valid_csrf_token(self) -> None:
         body = b"csrf_token=test-csrf-token"
@@ -736,7 +702,7 @@ class SetupServerTest(unittest.TestCase):
         handler.send_csrf_error.assert_not_called()
 
     def test_post_dispatch_rejects_missing_or_invalid_csrf_token(self) -> None:
-        for body in (b"", b"csrf_token=wrong-token"):
+        for body in (b"", b"csrf_token=wrong-token", b"csrf_token=%C3%A9"):
             with self.subTest(body=body):
                 handler = object.__new__(SetupHandler)
                 handler.path = "/system/reset"
@@ -761,37 +727,6 @@ class SetupServerTest(unittest.TestCase):
 
         handler.send_request_error.assert_called_once_with(413, "Request is too large.")
 
-    def test_system_card_shows_version_and_uses_in_page_confirmations(self) -> None:
-        html = render_system_card()
-
-        self.assertIn('<h2 id="system-heading">System</h2>', html)
-        self.assertIn("Software Version", html)
-        self.assertIn(f'<strong class="system-version-number">v{__version__}</strong>', html)
-        self.assertNotIn("<h3>Software Update</h3>", html)
-        self.assertIn('data-system-update-status', html)
-        self.assertIn('data-system-update-description', html)
-        self.assertIn('data-confirm-trigger="update"', html)
-        self.assertIn('data-confirm-panel="update" hidden', html)
-        self.assertIn('action="/system/update"', html)
-        self.assertIn("Restore Device to Default Settings", html)
-        self.assertIn('data-confirm-trigger="reboot"', html)
-        self.assertIn('data-confirm-panel="reboot" hidden', html)
-        self.assertIn("Are you sure you want to reboot?", html)
-        self.assertIn('action="/system/reboot"', html)
-        self.assertIn('data-confirm-trigger="restore"', html)
-        self.assertIn('data-confirm-panel="restore" hidden', html)
-        self.assertIn("Are you sure you want to restore the device to default settings?", html)
-        self.assertIn('action="/system/reset"', html)
-        self.assertNotIn("window.confirm", PAGE)
-        self.assertIn('request.open("GET", "/system/update/status", true)', PAGE)
-        self.assertIn("refreshSystemUpdateStatus()", PAGE)
-        self.assertIn("softwareUpdateWasInstalling = true", PAGE)
-        self.assertIn('statusText.textContent = "Finishing update..."', PAGE)
-        self.assertIn("softwareUpdateWasInstalling ? 2000", PAGE)
-        self.assertIn('window.location.replace("/")', PAGE)
-        self.assertIn('description.hidden = !description.textContent.trim()', PAGE)
-        self.assertNotIn("This player is running the latest stable version of Chapter.", PAGE)
-
     def test_logo_asset_is_served_as_cached_png(self) -> None:
         handler = object.__new__(SetupHandler)
         handler.send_response = Mock()
@@ -808,35 +743,6 @@ class SetupServerTest(unittest.TestCase):
         handler.send_header.assert_any_call("Cache-Control", "public, max-age=86400")
         handler.send_header.assert_any_call("Content-Length", str(len(body)))
         handler.end_headers.assert_called_once_with()
-
-    def test_admin_page_uses_sse_with_polling_fallback(self) -> None:
-        self.assertIn('new EventSource("/player/events")', PAGE)
-        self.assertIn("source.onmessage", PAGE)
-        self.assertNotIn('addEventListener("status"', PAGE)
-        self.assertNotIn("Live updates:", PAGE)
-        self.assertNotIn("http-equiv=\"refresh\"", PAGE)
-        self.assertNotIn("window.setInterval(refreshPlayerStatus, 5000)", PAGE)
-        self.assertIn("fallbackPollTimer = window.setInterval(refreshPlayerStatus, 1000)", PAGE)
-        self.assertIn("pendingPlaybackAction", PAGE)
-        self.assertIn("setPendingPlayback", PAGE)
-        self.assertNotIn("applyOptimisticPlayback", PAGE)
-
-    def test_wifi_card_shows_forget_button_when_connected_to_home_wifi(self) -> None:
-        html = render_wifi_card(WifiStatus(connected=True, ssid="Chapter WiFi"))
-
-        self.assertIn("Connected to <strong>Chapter WiFi</strong>", html)
-        self.assertIn("open Wi-Fi network", html)
-        self.assertIn("Forget this WiFi network", html)
-        self.assertNotIn("password", html.lower())
-        self.assertNotIn('action="/wifi"', html)
-
-    def test_wifi_card_shows_setup_form_when_on_setup_hotspot(self) -> None:
-        html = render_wifi_card(WifiStatus(connected=True, ssid=SETUP_HOTSPOT_SSID))
-
-        self.assertIn("open Wi-Fi network", html)
-        self.assertIn("Connect to Wi-Fi", html)
-        self.assertIn('action="/wifi"', html)
-        self.assertNotIn("Forget this WiFi network", html)
 
     def test_wifi_forget_is_scheduled_after_five_second_response_window(self) -> None:
         timers = []
@@ -960,13 +866,9 @@ class SetupServerTest(unittest.TestCase):
         self.assertEqual(login_username({"user": {}}, "fallback"), "fallback")
 
     def test_login_and_refresh_player_saves_new_user_library_and_queues_refresh(self) -> None:
+        write_settings(AppConfig(control_click_enabled=False, screen_saver_mode=SCREEN_SAVER_BOOKS))
         with (
-            patch(
-                "abs_kids_player.setup_server.load_config",
-                return_value=AppConfig(control_click_enabled=False, screen_saver_mode=SCREEN_SAVER_BOOKS),
-            ),
             patch("abs_kids_player.setup_server.AudiobookshelfClient", FakeAudiobookshelfClient),
-            patch("abs_kids_player.setup_server.save_config") as save_config,
             patch("abs_kids_player.setup_server.queue_web_player_command") as queue_command,
         ):
             config = login_and_refresh_player("https://books.example.com", "chapter", "password")
@@ -977,31 +879,11 @@ class SetupServerTest(unittest.TestCase):
         self.assertEqual(config.username, "chapter")
         self.assertFalse(config.control_click_enabled)
         self.assertEqual(config.screen_saver_mode, SCREEN_SAVER_BOOKS)
-        save_config.assert_called_once_with(config)
+        self.assertEqual(read_settings(), config)
         self.assertEqual(
             [call.args for call in queue_command.call_args_list],
             [("pause",), ("refresh_library",)],
         )
-
-    def test_saved_username_treats_unknown_user_as_missing(self) -> None:
-        self.assertEqual(saved_username("unknown user"), "")
-        self.assertEqual(saved_username(" chapter "), "chapter")
-
-    def test_audiobookshelf_status_recovers_missing_username(self) -> None:
-        config = AppConfig(server_url="https://books.example.com", token="token", library_id="library-1")
-
-        with (
-            patch("abs_kids_player.setup_server.load_config", return_value=config),
-            patch("abs_kids_player.setup_server.AudiobookshelfClient", FakeAudiobookshelfClient),
-            patch("abs_kids_player.setup_server.save_config") as save_config,
-        ):
-            ok, message = audiobookshelf_status()
-
-        self.assertTrue(ok)
-        self.assertEqual(message, "Logged in to https://books.example.com as chapter")
-        saved = save_config.call_args.args[0]
-        self.assertEqual(saved.username, "chapter")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,22 @@
+<header class="page-heading"><h1>Audiobookshelf library</h1></header>
+<section class="divider-section" id="library-picker" data-library-id="{library_id}" data-request-id="{request_id}">
+  <dl class="status row-dividers">
+    <div class="status-row"><dt>Active library</dt><dd id="active-library">{library_name}</dd></div>
+    <div class="status-row"><dt>Last successful refresh</dt><dd id="last-refresh">{last_refresh}</dd></div>
+  </dl>
+  <p id="refresh-status" class="muted" role="status">{status_text}</p>
+  <form class="form-stack divided-form" action="/settings/catalogue" method="post">
+    {csrf}{catalogue_key}
+    <div class="field-action short-form">
+      <label class="field" for="library-choice">Audiobook library
+        <select id="library-choice" name="library_id" aria-describedby="library-options-status" required disabled></select>
+      </label>
+      <button id="library-save" name="action" value="select" disabled>Use library</button>
+    </div>
+    <p id="library-options-status" class="muted" role="status">{options_text}</p>
+  </form>
+  <form action="/settings/catalogue" method="post">
+    {csrf}{catalogue_key}
+    <button class="secondary" name="action" value="refresh"{disabled}>Refresh library</button>
+  </form>
+</section>

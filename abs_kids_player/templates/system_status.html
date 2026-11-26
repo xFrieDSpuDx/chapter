@@ -1,0 +1,24 @@
+<header class="page-heading"><h1>System status</h1></header>
+<div class="divider-stack">
+  <section class="divider-section" aria-labelledby="status-details">
+    <h2 id="status-details">Device and library</h2>
+    <dl class="status row-dividers">
+      <div class="status-row"><dt>Installed software</dt><dd>Chapter v{version} · build {build_id}</dd></div>
+      <div class="status-row"><dt>Last successful library refresh</dt><dd>{last_library_refresh}</dd></div>
+      <div class="status-row"><dt>Latest library refresh result</dt><dd>{library_result}</dd></div>
+      <div class="status-row"><dt>Last successful progress sync</dt><dd>{last_progress_sync}</dd></div>
+      <div class="status-row"><dt>Latest progress sync result</dt><dd>{progress_result}</dd></div>
+      <div class="status-row"><dt>Pending progress updates</dt><dd>{pending_count}</dd></div>
+      <div class="status-row"><dt>Free storage</dt><dd>{storage_free}</dd></div>
+      <div class="status-row"><dt>Downloaded audio</dt><dd>{storage_used} of {storage_limit} allowed</dd></div>
+    </dl>
+    <div class="actions">
+      <a class="button secondary" href="/system/status">Refresh status</a>
+      <a class="button" href="/system/diagnostics">Download diagnostics (JSON)</a>
+    </div>
+  </section>
+  <section class="divider-section" aria-labelledby="playback-history-heading">
+    <h2 id="playback-history-heading">Recent playback starts</h2>
+    {playback_history}
+  </section>
+</div>

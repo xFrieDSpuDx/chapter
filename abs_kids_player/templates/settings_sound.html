@@ -1,0 +1,18 @@
+<form class="divider-section form-stack" method="post" action="/settings/sound">
+  {csrf}
+  <fieldset class="field-group">
+    <legend>Control knob click</legend>
+    <label class="check-field"><input type="checkbox" name="control_click_enabled" value="1"{click_checked}><span>Play a click when the knob is turned</span></label>
+    <label class="field setting-form">Click volume (%)
+      <input name="control_click_volume_percent" type="number" min="0" max="100" value="{click_volume}" required>
+    </label>
+  </fieldset>
+  <fieldset class="field-group divided-form">
+    <legend>Spoken navigation</legend>
+    <label class="check-field"><input type="checkbox" name="spoken_navigation_enabled" value="1"{speech_checked}><span>Read menus aloud</span></label>
+    <label class="field setting-form">Speech volume (%)
+      <input name="spoken_navigation_volume_percent" type="number" min="0" max="100" value="{speech_volume}" required>
+    </label>
+  </fieldset>
+  <div class="form-footer"><button type="submit">Save sound settings</button></div>
+</form>

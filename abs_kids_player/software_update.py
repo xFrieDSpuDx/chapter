@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import pwd
 import re
 import subprocess
 import tempfile
@@ -13,19 +12,36 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
-from .storage import ensure_storage_directory, finalize_storage_file
+from .storage import write_json_atomically
+from .update_recovery import (
+    OLED_SERVICE,
+    PLAYER_SERVICES,
+    PREVIOUS_RELEASE_REF,
+    SETUP_SERVICE,
+    discard_journal,
+    installer_files,
+    recovery_directory,
+    recovery_lock,
+    require_managed_checkout,
+    restore_deployment,
+    retain_deployment,
+    wait_for_player_services,
+)
 
 
 DEFAULT_REPO_URL = "https://github.com/chrismtopher/chapter.git"
 DEFAULT_INSTALL_USER = "chapter"
-DEFAULT_INSTALL_DIR = "/home/chapter/audiobookshelf-player"
+DEFAULT_INSTALL_DIR = "/opt/chapter-player/git"
 UPDATE_SERVICE_NAME = "audiobookshelf-player-update.service"
 UPDATE_STATE_FILENAME = "software-update.json"
-RELEASE_TAG_PATTERN = re.compile(r"^refs/tags/v(\d+)\.(\d+)\.(\d+)$")
-VERSION_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+VERSION_NUMBER = r"([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})"
+RELEASE_TAG_PATTERN = re.compile(rf"refs/tags/v{VERSION_NUMBER}")
+VERSION_PATTERN = re.compile(rf"v?{VERSION_NUMBER}")
 UPDATE_CHECK_TIMEOUT_SECONDS = 15
 UPDATE_INSTALL_TIMEOUT_SECONDS = 45 * 60
 STALE_UPDATE_SECONDS = 60 * 60
+
+UPDATE_ERRORS = (OSError, KeyError, ValueError, RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired)
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -83,7 +99,7 @@ def check_for_update(
         return ReleaseCheck(current_version=current_version, error="Invalid installed version.")
     try:
         result = runner(
-            ["git", "ls-remote", "--refs", "--tags", repo_url, "v*"],
+            ["git", "ls-remote", "--refs", "--tags", "--", repo_url, "v*"],
             timeout=UPDATE_CHECK_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
@@ -113,25 +129,26 @@ def update_status_payload() -> dict:
             "currentVersion": __version__,
             "latestVersion": state.target_version,
             "updateAvailable": False,
-            "phase": state.phase,
+            "phase": "installing",
+            "installationStage": state.phase,
             "message": state.message or "Installing the software update.",
         }
 
     release = check_for_update()
     message = ""
     phase = "available" if release.update_available else "current"
-    if release.error:
-        phase = "error"
-        message = release.error
-    elif state.phase == "installing":
-        phase = "failed"
-        message = "The previous update did not finish. You can try installing it again."
-    elif state.phase == "failed":
+    if state.phase == "failed":
         phase = "failed"
         message = state.message or "The previous software update failed."
-    elif state.phase == "completed" and state.target_version == release.current_version:
+    elif state.phase in ("installing", "verifying", "rolling_back"):
+        phase = "failed"
+        message = "The previous update did not finish. You can try installing it again."
+    elif state.phase == "completed" and state.target_version == release.current_version and not release.update_available:
         phase = "completed"
         message = state.message or f"Updated successfully to v{release.current_version}."
+    elif release.error:
+        phase = "error"
+        message = release.error
     return {
         "currentVersion": release.current_version,
         "latestVersion": release.latest_version,
@@ -147,7 +164,7 @@ def update_state_is_active(
 ) -> bool:
     current_time = time.time() if now is None else now
     return (
-        state.phase == "installing"
+        state.phase in ("installing", "verifying", "rolling_back")
         and state.updated_at > 0
         and current_time - state.updated_at < STALE_UPDATE_SECONDS
     )
@@ -164,28 +181,21 @@ def load_update_state() -> SoftwareUpdateState:
     path = update_state_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return SoftwareUpdateState()
-    return SoftwareUpdateState(
-        phase=str(data.get("phase", "idle")),
-        target_version=str(data.get("target_version", "")),
-        message=str(data.get("message", "")),
-        updated_at=float(data.get("updated_at") or 0),
-        display_ready=bool(data.get("display_ready")),
-    )
+        if isinstance(data, dict):
+            return SoftwareUpdateState(
+                phase=str(data.get("phase", "idle")),
+                target_version=str(data.get("target_version", "")),
+                message=str(data.get("message", "")),
+                updated_at=float(data.get("updated_at") or 0),
+                display_ready=bool(data.get("display_ready")),
+            )
+    except (OSError, TypeError, ValueError):
+        pass
+    return SoftwareUpdateState()
 
 
 def save_update_state(state: SoftwareUpdateState) -> None:
-    path = update_state_path()
-    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    ensure_storage_directory(path.parent)
-    try:
-        temporary_path.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
-        finalize_storage_file(temporary_path)
-        temporary_path.replace(path)
-        finalize_storage_file(path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
+    write_json_atomically(update_state_path(), asdict(state), durable=True)
 
 
 def mark_update_display_ready() -> bool:
@@ -227,27 +237,12 @@ def wait_for_update_display_ready(
         sleeper(min(max(poll_seconds, 0.01), remaining))
 
 
-def command_for_install_user(args: list[str], install_user: str) -> list[str]:
-    if os.geteuid() != 0:
-        return args
-    account = pwd.getpwnam(install_user)
-    return [
-        "runuser",
-        "-u",
-        install_user,
-        "--",
-        "env",
-        f"HOME={account.pw_dir}",
-        *args,
-    ]
-
-
 def concise_error(error: BaseException) -> str:
     if isinstance(error, subprocess.CalledProcessError):
         detail = (error.stderr or error.stdout or "").strip().splitlines()
         if detail:
             return detail[-1][:240]
-    return str(error)[:240] or "Unknown update error."
+    return str(error)[:540] or "Unknown update error."
 
 
 def install_latest_release(
@@ -255,20 +250,30 @@ def install_latest_release(
     repo_url: str | None = None,
     install_user: str | None = None,
     install_dir: str | None = None,
+    *,
+    health_check: Callable[[str, float, CommandRunner], None] = wait_for_player_services,
 ) -> str:
     repo_url = repo_url or os.environ.get("CHAPTER_REPO_URL", DEFAULT_REPO_URL)
     install_user = install_user or os.environ.get("CHAPTER_INSTALL_USER", DEFAULT_INSTALL_USER)
     install_dir = install_dir or os.environ.get("CHAPTER_INSTALL_DIR", DEFAULT_INSTALL_DIR)
+    requested = load_update_state()
+    expected_version = ""
+    if requested.phase == "installing" and update_state_is_active(requested):
+        expected_version = requested.target_version
     release = check_for_update(repo_url=repo_url, runner=runner)
-    if release.error:
+    error = release.error
+    if not error and expected_version and (not release.update_available or release.latest_version != expected_version):
+        error = "The available release changed. Review the current version and try again."
+    if error:
         save_update_state(
             SoftwareUpdateState(
                 phase="failed",
-                message=f"Update failed: {release.error}",
+                target_version=expected_version,
+                message=f"Update failed: {error}",
                 updated_at=time.time(),
             )
         )
-        raise RuntimeError(release.error)
+        raise RuntimeError(error)
     if not release.update_available:
         save_update_state(
             SoftwareUpdateState(
@@ -281,73 +286,85 @@ def install_latest_release(
         return release.current_version
 
     target_tag = f"v{release.latest_version}"
-    save_update_state(
-        SoftwareUpdateState(
-            phase="installing",
-            target_version=release.latest_version,
-            message=f"Installing {target_tag}. The player will restart when it is ready.",
-            updated_at=time.time(),
-        )
-    )
-    try:
-        runner(
-            command_for_install_user(
-                ["git", "-C", install_dir, "fetch", "--force", "--tags", "origin"],
-                install_user,
-            ),
-            timeout=120,
-        )
-        installer = runner(
-            command_for_install_user(
-                ["git", "-C", install_dir, "show", f"{target_tag}:scripts/install-raspberry-pi.sh"],
-                install_user,
-            ),
-            timeout=30,
+
+    def state(phase: str, message: str) -> None:
+        save_update_state(SoftwareUpdateState(
+            phase=phase, target_version=release.latest_version, message=message, updated_at=time.time(),
+        ))
+
+    def git(*args: str, timeout: int = 30) -> str:
+        return runner(
+            ["git", "-C", install_dir, *args],
+            timeout=timeout,
         ).stdout
+
+    def restart_and_check(version: str) -> None:
+        restarted_at = time.time()
+        for unit in (SETUP_SERVICE, OLED_SERVICE):
+            runner(["systemctl", "restart", unit], timeout=30)
+        health_check(version, restarted_at, runner)
+
+    state("installing", f"Installing {target_tag}. The player will restart when it is ready.")
+    try:
+        require_managed_checkout(Path(install_dir))
+        if git("status", "--porcelain").strip():
+            raise RuntimeError("The installed checkout has local changes. Keep a clean release checkout for online updates.")
+        previous_commit = git("rev-parse", "--verify", "HEAD").strip()
+        git("fetch", "--no-tags", "--", repo_url, f"refs/tags/{target_tag}", timeout=120)
+        target_commit = git("rev-parse", "--verify", "FETCH_HEAD^{commit}").strip()
+        installer = git("show", f"{target_commit}:scripts/install-raspberry-pi.sh")
         if not installer.startswith("#!/usr/bin/env bash"):
             raise RuntimeError("The release installer could not be verified.")
+        if "# Chapter install layout: root-owned-v1" not in installer.splitlines()[:4]:
+            raise RuntimeError("This release installer does not support a root-owned installation.")
+        git("update-ref", PREVIOUS_RELEASE_REF, previous_commit)
 
-        with tempfile.TemporaryDirectory(prefix="chapter-update-") as temporary_dir:
-            installer_path = Path(temporary_dir) / "install-raspberry-pi.sh"
-            installer_path.write_text(installer, encoding="utf-8")
-            installer_path.chmod(0o700)
-            runner(
-                [
-                    "bash",
-                    str(installer_path),
-                    "--release-ref",
-                    target_tag,
-                    "--repo-url",
-                    repo_url,
-                    "--user",
-                    install_user,
-                    "--install-dir",
-                    install_dir,
-                    "--no-reboot",
-                ],
-                timeout=UPDATE_INSTALL_TIMEOUT_SECONDS,
-            )
-
-        runner(["systemctl", "restart", "audiobookshelf-player-setup.service"], timeout=30)
-        save_update_state(
-            SoftwareUpdateState(
-                phase="completed",
-                target_version=release.latest_version,
-                message=f"Updated successfully to {target_tag}.",
-                updated_at=time.time(),
-            )
-        )
-        runner(["systemctl", "restart", "audiobookshelf-player-oled.service"], timeout=30)
+        root = recovery_directory()
+        with recovery_lock(root) as acquired:
+            if not acquired:
+                raise RuntimeError("Another Chapter update or recovery is running.")
+            with tempfile.TemporaryDirectory(prefix="chapter-update-") as temporary_dir:
+                installer_path = Path(temporary_dir) / "install-raspberry-pi.sh"
+                installer_path.write_text(installer, encoding="utf-8")
+                installer_path.chmod(0o700)
+                journal = retain_deployment(
+                    root, installer_files(), install_dir=install_dir, install_user=install_user,
+                    checkout_owner="root", previous_commit=previous_commit, previous_version=release.current_version,
+                    target_version=release.latest_version, state_file=str(update_state_path()),
+                )
+                try:
+                    runner(
+                        [
+                            "bash", str(installer_path), "--release-ref", target_commit, "--repo-url", repo_url,
+                            "--user", install_user, "--install-dir", install_dir, "--no-reboot",
+                        ],
+                        timeout=UPDATE_INSTALL_TIMEOUT_SECONDS,
+                    )
+                    state("verifying", f"Checking the setup and OLED services for {target_tag}.")
+                    restart_and_check(release.latest_version)
+                except UPDATE_ERRORS as error:
+                    detail = concise_error(error)
+                    try:
+                        state("rolling_back", f"Restoring the previous build after {target_tag} failed.")
+                        try:
+                            runner(["systemctl", "stop", *PLAYER_SERVICES], timeout=30)
+                        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                            pass
+                        restore_deployment(journal, runner)
+                        restart_and_check(release.current_version)
+                        discard_journal(journal)
+                    except UPDATE_ERRORS as recovery_error:
+                        raise RuntimeError(
+                            f"{detail} Automatic rollback could not be verified: {concise_error(recovery_error)}"
+                        ) from recovery_error
+                    raise RuntimeError(
+                        f"{detail} Restored the previous build (v{release.current_version})."
+                    ) from error
+                state("completed", f"Updated successfully to {target_tag}.")
+                discard_journal(journal)
         return release.latest_version
-    except (OSError, KeyError, RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        save_update_state(
-            SoftwareUpdateState(
-                phase="failed",
-                target_version=release.latest_version,
-                message=f"Update failed: {concise_error(error)}",
-                updated_at=time.time(),
-            )
-        )
+    except UPDATE_ERRORS as error:
+        state("failed", f"Update failed: {concise_error(error)}")
         raise
 
 

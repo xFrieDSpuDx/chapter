@@ -3,30 +3,29 @@ from __future__ import annotations
 import unittest
 
 from abs_kids_player.config import LIBRARY_SORT_AUTHOR
-from abs_kids_player.models import AudioTrack, Book, Chapter, PlaybackSession
-from abs_kids_player.player_state import LastPlaybackState
-from abs_kids_player.rotary_ui import (
-    ApplianceMenu,
+from abs_kids_player.display_frames import (
     BluetoothDevicesFrame,
     BluetoothMenuFrame,
     ChapterConfirmFrame,
-    CommandType,
     HomeFrame,
-    PLAYING_PLAY_INDEX,
     PlayingFrame,
     ResumeChoiceFrame,
-    Screen,
     SleepConfirmFrame,
     StartupResumeFrame,
+    TwoLineFrame,
     VolumeFrame,
     author_line,
-    author_section_letter,
-    author_sort_text,
+    volume_bar,
+)
+from abs_kids_player.models import AudioTrack, Book, Chapter, PlaybackSession
+from abs_kids_player.player_state import LastPlaybackState
+from abs_kids_player.rotary_ui import (
+    PLAYING_PLAY_INDEX,
+    ApplianceMenu,
+    CommandType,
+    Screen,
     marquee_text,
     power_off_resume_time,
-    title_sort_text,
-    title_section_letter,
-    volume_bar,
 )
 
 
@@ -39,6 +38,60 @@ BOOKS_WITH_HISTORY = [
     Book("book-1", "The Wild Robot", "Peter Brown", 1000, "", current_time=120, progress=0.12),
     Book("book-2", "Matilda", "Roald Dahl", 1000, ""),
 ]
+
+
+class LibraryRecoveryTest(unittest.TestCase):
+    def test_press_retries_a_failed_library_and_success_returns_to_book_selection(self) -> None:
+        menu = ApplianceMenu()
+        menu.library_error = TwoLineFrame("Server unreachable", "Press to retry")
+
+        self.assertEqual(menu.render().bottom, "Press to retry")
+        self.assertEqual([command.type for command in menu.click_nav()], [CommandType.RETRY_LIBRARY])
+
+        menu.set_books(BOOKS)
+        self.assertIsNone(menu.library_error)
+        self.assertEqual(menu.render().title, "The Wild Robot")
+        self.assertEqual(menu.click_nav(), [])
+        self.assertEqual(menu.screen, Screen.RESUME_CHOICE)
+
+
+class LibrarySelectionTest(unittest.TestCase):
+    def test_reordering_keeps_the_selected_book_by_id(self) -> None:
+        menu = ApplianceMenu(BOOKS)
+        menu.rotate_nav(1)
+        menu.set_books(list(reversed(BOOKS)))
+
+        self.assertEqual(menu.render().title, "Matilda")
+        self.assertEqual(menu.book_index, 0)
+
+    def test_refresh_keeps_the_book_and_action_in_an_open_confirmation(self) -> None:
+        menu = ApplianceMenu(BOOKS_WITH_HISTORY)
+        menu.click_nav()
+        menu.rotate_nav(1)
+        menu.set_books(list(reversed(BOOKS_WITH_HISTORY)))
+
+        self.assertEqual(menu.render().title, "The Wild Robot")
+        self.assertEqual(menu.resume_options[menu.resume_choice_index], "Start over")
+        command, = menu.click_nav()
+        self.assertEqual(command.book_id, "book-1")
+        self.assertTrue(command.start_over)
+
+    def test_removed_book_closes_confirmation_without_starting_a_different_book(self) -> None:
+        menu = ApplianceMenu(BOOKS)
+        menu.click_nav()
+        menu.set_books([BOOKS[1]])
+
+        self.assertEqual(menu.screen, Screen.LIBRARY)
+        self.assertEqual(menu.render().title, "Matilda")
+        self.assertEqual(menu.click_nav(), [])
+
+    def test_disappearing_resume_choice_leaves_focus_on_home(self) -> None:
+        menu = ApplianceMenu(BOOKS_WITH_HISTORY)
+        menu.click_nav()
+        menu.set_books(BOOKS)
+
+        self.assertEqual(menu.screen, Screen.RESUME_CHOICE)
+        self.assertEqual(menu.resume_options[menu.resume_choice_index], "Home")
 
 
 def make_session() -> PlaybackSession:
@@ -258,7 +311,7 @@ class ApplianceMenuTest(unittest.TestCase):
         self.assertFalse(command.start_over)
         self.assertEqual(command.resume_time, 120)
 
-    def test_start_is_default_without_history(self) -> None:
+    def test_start_with_no_cached_history_checks_for_a_position_on_the_server(self) -> None:
         menu = ApplianceMenu(BOOKS)
         menu.click_nav()
 
@@ -266,7 +319,7 @@ class ApplianceMenuTest(unittest.TestCase):
 
         self.assertEqual(command.type, CommandType.PLAY_BOOK)
         self.assertEqual(command.book_id, "book-1")
-        self.assertTrue(command.start_over)
+        self.assertFalse(command.start_over)
 
     def test_start_over_can_be_selected_when_history_exists(self) -> None:
         menu = ApplianceMenu(BOOKS_WITH_HISTORY)
@@ -559,21 +612,8 @@ class ApplianceMenuTest(unittest.TestCase):
         self.assertEqual(commands[0].type, CommandType.PAUSE_PLAYBACK)
         self.assertIsInstance(frame, BluetoothMenuFrame)
         self.assertTrue(frame.enabled)
-        self.assertEqual(frame.options, ("Back", "Disable", "Pair"))
+        self.assertEqual(frame.options, ("Back", "Disable", "Speakers"))
         self.assertEqual(frame.selected_index, 2)
-
-    def test_control_hold_shows_unpair_when_bluetooth_connected(self) -> None:
-        menu = ApplianceMenu(BOOKS)
-
-        menu.hold_nav(bluetooth_enabled=True, bluetooth_connected=True)
-        frame = menu.render()
-
-        self.assertIsInstance(frame, BluetoothMenuFrame)
-        self.assertEqual(frame.options, ("Back", "Disable", "Unpair"))
-
-        command = menu.click_nav()[0]
-
-        self.assertEqual(command.type, CommandType.UNPAIR_BLUETOOTH_DEVICE)
 
     def test_bluetooth_menu_can_disable_bluetooth(self) -> None:
         menu = ApplianceMenu(BOOKS)
@@ -587,34 +627,7 @@ class ApplianceMenuTest(unittest.TestCase):
         self.assertFalse(command.bluetooth_enabled)
         self.assertIsInstance(frame, BluetoothMenuFrame)
         self.assertFalse(frame.enabled)
-        self.assertEqual(frame.options, ("Back", "Enable", "Pair"))
-
-    def test_bluetooth_pair_turns_bluetooth_on_when_disabled(self) -> None:
-        menu = ApplianceMenu(BOOKS)
-        menu.hold_nav(bluetooth_enabled=False)
-
-        menu.rotate_nav(1)
-        commands = menu.click_nav()
-
-        self.assertEqual(commands[0].type, CommandType.SET_BLUETOOTH_ENABLED)
-        self.assertTrue(commands[0].bluetooth_enabled)
-        self.assertEqual(commands[1].type, CommandType.START_BLUETOOTH_SCAN)
-
-    def test_bluetooth_device_list_scrolls_and_selects_device(self) -> None:
-        menu = ApplianceMenu(BOOKS)
-
-        menu.set_bluetooth_devices(
-            [
-                ("AA:BB:CC:DD:EE:FF", "Playroom Speaker"),
-                ("11:22:33:44:55:66", "Blue Headphones"),
-            ]
-        )
-        menu.rotate_nav(1)
-        command = menu.click_nav()[0]
-
-        self.assertEqual(command.type, CommandType.PAIR_BLUETOOTH_DEVICE)
-        self.assertEqual(command.bluetooth_device_address, "11:22:33:44:55:66")
-        self.assertEqual(command.bluetooth_device_name, "Blue Headphones")
+        self.assertEqual(frame.options, ("Back", "Enable", "Speakers"))
 
     def test_bluetooth_device_list_shortens_long_names_before_marker(self) -> None:
         frame = BluetoothDevicesFrame(
@@ -686,30 +699,6 @@ class ApplianceMenuTest(unittest.TestCase):
     def test_author_line_prefixes_author(self) -> None:
         self.assertEqual(author_line("Peter Brown"), "By Peter Brown")
         self.assertEqual(author_line(""), "")
-
-    def test_title_section_letter_uses_first_title_letter(self) -> None:
-        self.assertEqual(title_section_letter("  the hobbit"), "H")
-        self.assertEqual(title_section_letter("A Wrinkle in Time"), "W")
-        self.assertEqual(title_section_letter("The A Team"), "T")
-        self.assertEqual(title_section_letter("Theodore Boone"), "T")
-        self.assertEqual(title_section_letter("Anansi Boys"), "A")
-        self.assertEqual(title_section_letter("...Matilda"), "M")
-        self.assertEqual(title_section_letter("1984"), "#")
-
-    def test_title_sort_text_ignores_leading_articles(self) -> None:
-        self.assertEqual(title_sort_text("The Hobbit"), "hobbit")
-        self.assertEqual(title_sort_text("A Wrinkle in Time"), "wrinkle in time")
-        self.assertEqual(title_sort_text("The A Team"), "team")
-        self.assertEqual(title_sort_text("Theodore Boone"), "theodore boone")
-        self.assertEqual(title_sort_text("Anansi Boys"), "anansi boys")
-
-    def test_author_sort_text_uses_first_authors_last_name(self) -> None:
-        self.assertEqual(author_sort_text("J.R.R. Tolkien"), "tolkien j.r.r.")
-        self.assertEqual(author_sort_text("Mary Pope Osborne"), "osborne mary pope")
-        self.assertEqual(author_sort_text("Neil Gaiman & Terry Pratchett"), "gaiman neil")
-        self.assertEqual(author_sort_text("Dahl, Roald"), "dahl")
-        self.assertEqual(author_sort_text(""), "")
-        self.assertEqual(author_section_letter("Madeleine L'Engle"), "L")
 
     def test_marquee_text_scrolls_with_gap(self) -> None:
         self.assertEqual(marquee_text("Long title", 4, 0), "Long")

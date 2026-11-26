@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from abs_kids_player.audio import (
     BOOT_CHIME_SAMPLE_RATE,
     change_volume,
     ensure_boot_chime_wav,
+    ensure_control_click_wav,
     parse_amixer_volume,
     parse_pactl_muted,
     parse_pactl_volume,
@@ -33,6 +35,25 @@ class FakeRunner:
 
 
 class AudioTest(unittest.TestCase):
+    def test_feedback_waveforms_honour_configured_levels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for name, make_waveform in (
+                ("click", ensure_control_click_wav),
+                ("boot", ensure_boot_chime_wav),
+            ):
+                with self.subTest(waveform=name):
+                    quiet_path = Path(directory) / f"{name}-quiet.wav"
+                    loud_path = Path(directory) / f"{name}-loud.wav"
+                    make_waveform(quiet_path, 3)
+                    make_waveform(loud_path, 12)
+                    peaks = []
+                    for path in (quiet_path, loud_path):
+                        with wave.open(str(path), "rb") as wav:
+                            samples = wav.readframes(wav.getnframes())
+                        peaks.append(max(abs(sample) for (sample,) in struct.iter_unpack("<h", samples)))
+                    self.assertGreater(peaks[0], 0)
+                    self.assertAlmostEqual(peaks[1] / peaks[0], 4, delta=0.05)
+
     def test_boot_chime_is_a_short_nonempty_mono_wav(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "boot-chime.wav"

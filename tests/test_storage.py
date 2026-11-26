@@ -32,7 +32,13 @@ class StorageOwnershipTest(unittest.TestCase):
             self.assertEqual(config_dir.stat().st_mode & 0o777, 0o700)
             self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
             chown.assert_any_call(config_dir, 123, 456)
-            chown.assert_any_call(config_path, 123, 456)
+            # The private temporary file gets its owner before it replaces the live file.
+            self.assertTrue(
+                any(
+                    call.args[0].parent == config_dir and call.args[1:] == (123, 456)
+                    for call in chown.call_args_list
+                )
+            )
 
     def test_root_web_command_is_handed_to_service_user(self) -> None:
         owner = SimpleNamespace(pw_uid=123, pw_gid=456)
@@ -48,6 +54,7 @@ class StorageOwnershipTest(unittest.TestCase):
                 ),
                 patch("abs_kids_player.storage.configured_storage_owner", return_value=owner),
                 patch("abs_kids_player.storage.os.chown") as chown,
+                patch.object(Path, "replace", autospec=True, side_effect=Path.replace) as replace,
             ):
                 queue_web_player_command("pause")
 
@@ -55,7 +62,9 @@ class StorageOwnershipTest(unittest.TestCase):
             self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
             self.assertEqual(command_path.stat().st_mode & 0o777, 0o600)
             chown.assert_any_call(state_dir, 123, 456)
-            chown.assert_any_call(command_path, 123, 456)
+            temporary_path, destination = replace.call_args.args
+            self.assertEqual(destination, command_path)
+            chown.assert_any_call(temporary_path, 123, 456)
 
 
 if __name__ == "__main__":

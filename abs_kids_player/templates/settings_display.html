@@ -1,0 +1,36 @@
+<form class="divider-section form-stack" method="post" action="/settings/display">
+  {csrf}
+  <fieldset class="field-group">
+    <legend>Screen saver</legend>
+    <div class="field-grid">
+      <label class="field">Style
+        <select name="screen_saver_mode" aria-label="Screen saver style">{screen_saver_options}</select>
+      </label>
+      <label class="field">Dim level
+        <select name="screen_saver_dim_percent" aria-label="Screen saver dim level">{screen_saver_dim_options}</select>
+      </label>
+      <label class="field">Clock format
+        <select name="screen_saver_clock_format">{screen_saver_clock_options}</select>
+      </label>
+    </div>
+  </fieldset>
+  <fieldset class="field-group divided-form">
+    <legend>OLED burn-in protection</legend>
+    <div class="field-grid night-fields">
+      <label class="field">Turn screen off after last dial use
+        <select name="screen_off_minutes">{screen_off_options}</select>
+      </label>
+      <div class="field night-time">
+        <label for="screen-off-start">Screen off from</label>
+        <input id="screen-off-start" name="screen_off_start" type="time" value="{screen_off_start}">
+      </div>
+      <div class="field night-time">
+        <label for="screen-off-end">Screen off until</label>
+        <input id="screen-off-end" name="screen_off_end" type="time" value="{screen_off_end}">
+      </div>
+    </div>
+    <p class="hint">Use either rule or both. Times follow the Pi’s local clock. Clear both times to disable the schedule.</p>
+    <p class="hint">Audio keeps playing with the screen off. Press or turn either dial to wake it. During scheduled hours it stays awake for one minute after your last dial input.</p>
+  </fieldset>
+  <div class="form-footer"><button type="submit">Save display settings</button></div>
+</form>

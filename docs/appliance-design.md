@@ -99,10 +99,12 @@ When the selected book has listening history, `Continue` is the default selectio
 
 ```text
 Top:    scrolling chapter title with remaining time at the upper-right
-Bottom: Home | Prev | Play/Pause | Next
+Bottom: Home | Prev | Play/Pause | Next | ...
 ```
 
 The Select knob moves left and right through the action row, stopping at the edges. Click it to choose the focused action. `Play/Pause` is focused by default when playback starts. `Prev` and `Next` ask for confirmation before changing chapters. Returning to `Home` while audio continues playing automatically returns to this playback screen after five seconds without input.
+
+On the local build the **...** button opens skips, chapter selection, a sleep timer and session actions including **Stop playback**. [Listening controls](listening-guide.md#while-a-book-is-open)
 
 Long chapter titles scroll horizontally while the remaining-time display and bottom action row stay fixed.
 
@@ -212,7 +214,7 @@ The USB-C connector supplies power only. Continue to use Wi-Fi or the Pi's origi
 The player exposes a local setup page on port `47831`. The appliance can also install a port `80` proxy so people can browse without typing a port:
 
 ```text
-http://raspberrypi.local
+http://chapter-player.local
 ```
 
 On boot, the setup service should run with Wi-Fi fallback enabled:
@@ -253,7 +255,7 @@ This lets a parent change which Audiobookshelf user the appliance uses without a
 
 To reveal the address without a monitor, hold the Volume knob for 10 seconds while the unit is powered on. The OLED should show the setup URL, such as `http://192.168.1.42`, for 5 seconds and then return to the previous screen.
 
-The web interface shows separate status rows for Wi-Fi, Audiobookshelf, Bluetooth, and current playback. Its System tab shows the installed version, available software updates, reboot control, and device-reset control. The `/health` route exposes machine-readable status for diagnostics.
+Overview shows listening and connection status. **System → System status and diagnostics** shows the installed build and can export a JSON report. The `/health` route renders an HTML health page. For the local Debian build, **System** shows **Local package installed**. The package helper handles upgrades and rollback. [Local Pi release guide](local-pi-release.md)
 
 ## Enclosure Notes
 

@@ -51,25 +51,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
             timeout=10,
         )
         try:
-            connection.request(self.command, target_path, body=body, headers=headers)
-            response = connection.getresponse()
-        except OSError as error:
-            self.send_error(502, f"Setup server is not reachable: {error}")
-            return
-
-        self.send_response(response.status, response.reason)
-        for key, value in response.getheaders():
-            if key.lower() not in HOP_BY_HOP_HEADERS:
-                self.send_header(key, value)
-        self.end_headers()
-        if self.command != "HEAD":
             try:
+                connection.request(self.command, target_path, body=body, headers=headers)
+                response = connection.getresponse()
+            except (OSError, http.client.HTTPException) as error:
+                self.send_error(502, f"Setup server is not reachable: {error}")
+                return
+            self.send_response(response.status, response.reason)
+            for key, value in response.getheaders():
+                if key.lower() not in HOP_BY_HOP_HEADERS:
+                    self.send_header(key, value)
+            self.end_headers()
+            if self.command != "HEAD":
                 self.stream_response(response)
-            except (BrokenPipeError, ConnectionResetError, TimeoutError):
-                pass
-            finally:
-                connection.close()
-        else:
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
+        finally:
             connection.close()
 
     def target_path(self) -> str:
@@ -94,6 +91,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 class ProxyServer(ThreadingHTTPServer):
+    request_queue_size = 64
     target_host: str
     target_port: int
 

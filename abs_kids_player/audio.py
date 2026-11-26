@@ -16,9 +16,10 @@ CONTROL_CLICK_WAV_PATH = Path("/tmp/chapter-control-click-v2.wav")
 CONTROL_CLICK_SAMPLE_RATE = 16000
 CONTROL_CLICK_SECONDS = 0.018
 CONTROL_CLICK_FREQUENCY_HZ = 1150
-CONTROL_CLICK_MAX_PERCENT = 18
+CONTROL_CLICK_PEAK_AMPLITUDE = 0.18
 BOOT_CHIME_WAV_PATH = Path("/tmp/chapter-boot-chime-v2.wav")
 BOOT_CHIME_SAMPLE_RATE = 24000
+BOOT_CHIME_MAX_PERCENT = 13
 BOOT_CHIME_VOICES = (
     (0.000, 0.20, 523.25, 0.72),
     (0.085, 0.20, 659.25, 0.76),
@@ -98,22 +99,16 @@ def toggle_mute(
     raise AudioError(f"Could not toggle mute: {last_error}")
 
 
-def play_control_click(percent: int = 12) -> None:
-    ensure_control_click_wav()
-    volume = max(0, min(percent, CONTROL_CLICK_MAX_PERCENT))
+def play_control_click(percent: int) -> None:
+    volume = max(0, min(percent, 100))
     if volume <= 0:
         return
-    try:
-        subprocess.Popen(
-            ["aplay", "-q", str(CONTROL_CLICK_WAV_PATH)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except (FileNotFoundError, OSError):
-        return
+    path = _waveform_path(CONTROL_CLICK_WAV_PATH, volume)
+    ensure_control_click_wav(path, volume)
+    _play_wav(path)
 
 
-def ensure_control_click_wav(path: Path = CONTROL_CLICK_WAV_PATH) -> None:
+def ensure_control_click_wav(path: Path, percent: int) -> None:
     if path.exists():
         return
 
@@ -124,7 +119,7 @@ def ensure_control_click_wav(path: Path = CONTROL_CLICK_WAV_PATH) -> None:
         attack = min(1.0, progress / 0.18)
         envelope = attack * (1.0 - progress) ** 4
         wave_value = math.sin(2 * math.pi * CONTROL_CLICK_FREQUENCY_HZ * index / CONTROL_CLICK_SAMPLE_RATE)
-        sample = round(wave_value * envelope * 32767 * 0.13)
+        sample = round(wave_value * envelope * 32767 * CONTROL_CLICK_PEAK_AMPLITUDE * percent / 100)
         frames.extend(sample.to_bytes(2, byteorder="little", signed=True))
 
     try:
@@ -137,11 +132,23 @@ def ensure_control_click_wav(path: Path = CONTROL_CLICK_WAV_PATH) -> None:
         return
 
 
-def play_boot_chime() -> None:
-    ensure_boot_chime_wav()
+def play_boot_chime(percent: int = BOOT_CHIME_MAX_PERCENT) -> None:
+    volume = max(0, min(percent, BOOT_CHIME_MAX_PERCENT))
+    if volume <= 0:
+        return
+    path = _waveform_path(BOOT_CHIME_WAV_PATH, volume)
+    ensure_boot_chime_wav(path, volume)
+    _play_wav(path)
+
+
+def _waveform_path(path: Path, percent: int) -> Path:
+    return path.with_name(f"{path.stem}-{percent}{path.suffix}")
+
+
+def _play_wav(path: Path) -> None:
     try:
         subprocess.Popen(
-            ["aplay", "-q", str(BOOT_CHIME_WAV_PATH)],
+            ["aplay", "-q", str(path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -149,7 +156,10 @@ def play_boot_chime() -> None:
         return
 
 
-def ensure_boot_chime_wav(path: Path = BOOT_CHIME_WAV_PATH) -> None:
+def ensure_boot_chime_wav(
+    path: Path = BOOT_CHIME_WAV_PATH,
+    percent: int = BOOT_CHIME_MAX_PERCENT,
+) -> None:
     if path.exists():
         return
 
@@ -170,7 +180,7 @@ def ensure_boot_chime_wav(path: Path = BOOT_CHIME_WAV_PATH) -> None:
             phase = 2 * math.pi * frequency_hz * note_elapsed
             tone = math.sin(phase) + 0.14 * math.sin(phase * 2)
             mixed += (tone / 1.14) * envelope * level
-        sample = round(math.tanh(mixed * 0.72) * 32767 * 0.13)
+        sample = round(math.tanh(mixed * 0.72) * 32767 * percent / 100)
         frames.extend(sample.to_bytes(2, byteorder="little", signed=True))
 
     try:

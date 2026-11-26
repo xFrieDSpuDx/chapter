@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from abs_kids_player.config import (
+    CLOCK_FORMAT_12_HOUR,
+    CLOCK_FORMAT_24_HOUR,
     DEFAULT_PLAYBACK_SPEED,
     DEFAULT_SCREEN_SAVER_DIM_PERCENT,
     DEFAULT_SLEEP_TIMER_MINUTES,
@@ -31,20 +33,32 @@ from abs_kids_player.config import (
 
 
 class ConfigTest(unittest.TestCase):
+    def test_new_and_legacy_configs_prefer_downloads_unless_the_preference_was_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            with patch.dict("os.environ", {"ABS_KIDS_PLAYER_CONFIG_PATH": str(path)}):
+                self.assertTrue(load_config().prefer_downloaded)
+                path.write_text('{"library_id":"existing"}', encoding="utf-8")
+                self.assertTrue(load_config().prefer_downloaded)
+                for preference in (False, True):
+                    save_config(AppConfig(prefer_downloaded=preference))
+                    self.assertEqual(load_config().prefer_downloaded, preference)
+
     def test_playback_speed_defaults_to_one_and_validates_options(self) -> None:
         self.assertEqual(AppConfig().playback_speed, DEFAULT_PLAYBACK_SPEED)
+        self.assertEqual(PLAYBACK_SPEEDS, (1.0, 1.25, 1.5, 1.75, 2.0))
         for speed in PLAYBACK_SPEEDS:
             self.assertEqual(valid_playback_speed(speed), speed)
-        self.assertEqual(valid_playback_speed("1.5"), 1.5)
-        self.assertEqual(valid_playback_speed("1.25"), DEFAULT_PLAYBACK_SPEED)
+            self.assertEqual(valid_playback_speed(str(speed)), speed)
+        self.assertEqual(valid_playback_speed("1.3"), DEFAULT_PLAYBACK_SPEED)
         self.assertEqual(valid_playback_speed(None), DEFAULT_PLAYBACK_SPEED)
 
     def test_config_saves_playback_speed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict("os.environ", {"ABS_KIDS_PLAYER_CONFIG_DIR": temp_dir}, clear=False):
-                save_config(AppConfig(playback_speed=1.5))
-
-                self.assertEqual(load_config().playback_speed, 1.5)
+                for speed in PLAYBACK_SPEEDS:
+                    save_config(AppConfig(playback_speed=speed))
+                    self.assertEqual(load_config().playback_speed, speed)
 
     def test_library_sort_defaults_to_title_and_validates_modes(self) -> None:
         self.assertEqual(AppConfig().library_sort_mode, LIBRARY_SORT_TITLE)
@@ -141,16 +155,31 @@ class ConfigTest(unittest.TestCase):
     def test_config_saves_screen_saver_dim_level(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict("os.environ", {"ABS_KIDS_PLAYER_CONFIG_DIR": temp_dir}, clear=False):
-                save_config(AppConfig(screen_saver_dim_percent=10))
+                save_config(AppConfig(screen_saver_dim_percent=5))
 
-                self.assertEqual(load_config().screen_saver_dim_percent, 10)
+                self.assertEqual(load_config().screen_saver_dim_percent, 5)
 
     def test_screen_saver_dim_level_defaults_and_validates(self) -> None:
         self.assertEqual(AppConfig().screen_saver_dim_percent, DEFAULT_SCREEN_SAVER_DIM_PERCENT)
         self.assertEqual(valid_screen_saver_dim_percent(None), DEFAULT_SCREEN_SAVER_DIM_PERCENT)
         self.assertEqual(valid_screen_saver_dim_percent(10), 10)
+        self.assertEqual(valid_screen_saver_dim_percent("5"), 5)
         self.assertEqual(valid_screen_saver_dim_percent(99), DEFAULT_SCREEN_SAVER_DIM_PERCENT)
         self.assertIn(DEFAULT_SCREEN_SAVER_DIM_PERCENT, SCREEN_SAVER_DIM_LEVELS)
+
+    def test_feedback_volumes_have_independent_defaults_and_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.json"
+            with patch.dict("os.environ", {"ABS_KIDS_PLAYER_CONFIG_PATH": str(path)}):
+                path.write_text('{"spoken_navigation_enabled": true}', encoding="utf-8")
+                legacy = load_config()
+                self.assertEqual(legacy.control_click_volume_percent, 70)
+                self.assertEqual(legacy.spoken_navigation_volume_percent, 35)
+
+                save_config(AppConfig(control_click_volume_percent=0, spoken_navigation_volume_percent=24))
+                saved = load_config()
+                self.assertEqual(saved.control_click_volume_percent, 0)
+                self.assertEqual(saved.spoken_navigation_volume_percent, 24)
 
     def test_sleep_timer_is_disabled_by_default(self) -> None:
         config = AppConfig()
@@ -219,12 +248,24 @@ class ConfigTest(unittest.TestCase):
             with patch.dict("os.environ", {"ABS_KIDS_PLAYER_CONFIG_DIR": temp_dir}, clear=False):
                 self.assertEqual(load_config().screen_saver_mode, SCREEN_SAVER_CHAPTER)
 
-    def test_old_config_gets_default_screen_saver_dim_level(self) -> None:
+    def test_old_config_gets_default_screen_saver_dim_level_and_clock_format(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "config.json"
             path.write_text('{"screen_saver_mode": "clock"}', encoding="utf-8")
             with patch.dict("os.environ", {"ABS_KIDS_PLAYER_CONFIG_DIR": temp_dir}, clear=False):
-                self.assertEqual(load_config().screen_saver_dim_percent, DEFAULT_SCREEN_SAVER_DIM_PERCENT)
+                config = load_config()
+                self.assertEqual(config.screen_saver_dim_percent, DEFAULT_SCREEN_SAVER_DIM_PERCENT)
+                self.assertEqual(config.screen_saver_clock_format, CLOCK_FORMAT_12_HOUR)
+
+    def test_config_saves_clock_format_and_falls_back_from_an_unknown_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.json"
+            with patch.dict("os.environ", {"ABS_KIDS_PLAYER_CONFIG_PATH": str(path)}):
+                save_config(AppConfig(screen_saver_clock_format=CLOCK_FORMAT_24_HOUR))
+                self.assertEqual(load_config().screen_saver_clock_format, CLOCK_FORMAT_24_HOUR)
+
+                path.write_text('{"screen_saver_clock_format": "unknown"}', encoding="utf-8")
+                self.assertEqual(load_config().screen_saver_clock_format, CLOCK_FORMAT_12_HOUR)
 
 
 if __name__ == "__main__":

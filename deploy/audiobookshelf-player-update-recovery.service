@@ -1,0 +1,17 @@
+[Unit]
+Description=Recover an interrupted Chapter Player update
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target audiobookshelf-player-oled.service audiobookshelf-player-setup.service
+Conflicts=shutdown.target
+Before=shutdown.target
+ConditionPathIsDirectory=/var/lib/chapter-update/pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/chapter-update-recovery
+RemainAfterExit=yes
+TimeoutStartSec=90s
+
+[Install]
+WantedBy=sysinit.target

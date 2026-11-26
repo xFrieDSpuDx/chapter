@@ -6,7 +6,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from abs_kids_player.config import AppConfig, PodcastConfig
-from abs_kids_player.library_cache import clear_cached_books, library_cache_path, load_cached_books, save_cached_books
+from abs_kids_player.library_cache import (
+    clear_cached_books,
+    library_cache_path,
+    load_cached_books,
+    save_cached_books,
+)
 from abs_kids_player.models import Book
 
 

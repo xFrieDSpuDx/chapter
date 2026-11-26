@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from unittest.mock import patch
 
 from abs_kids_player.wifi import (
     SETUP_HOTSPOT_SSID,
@@ -31,6 +32,13 @@ class FakeRunner:
 
 
 class WifiTest(unittest.TestCase):
+    def test_networkmanager_status_has_a_timeout(self):
+        with patch("abs_kids_player.wifi.subprocess.run", side_effect=subprocess.TimeoutExpired("nmcli", 5)) as run:
+            status = wifi_status()
+        self.assertFalse(status.connected)
+        self.assertEqual(status.message, "Wi-Fi status timed out")
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
     def test_wifi_devices_parses_nmcli_output(self) -> None:
         runner = FakeRunner("wlan0:wifi:connected\nlo:loopback:connected\n")
 

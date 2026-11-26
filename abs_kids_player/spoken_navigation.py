@@ -71,6 +71,10 @@ class SpokenNavigationFeedback:
     def ready_to_start(self) -> bool:
         return self.pending is not None and self.clock() >= self.pending.due_at
 
+    @property
+    def needs_audio_output(self) -> bool:
+        return self.ready_to_start or self.audio_process is not None
+
     def start(self, request: SpeechRequest, output_device: str) -> None:
         if not shutil.which("espeak-ng") or not shutil.which("aplay"):
             if not self.unavailable_reported:

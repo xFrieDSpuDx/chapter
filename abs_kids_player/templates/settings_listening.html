@@ -1,0 +1,46 @@
+<form class="divider-section form-stack" method="post" action="/settings/listening">
+  {csrf}
+  <input type="hidden" name="listening_page" value="1">
+  <fieldset class="field-group">
+    <legend>Night mode</legend>
+    <div class="field-grid night-fields">
+      <label class="field" for="night-mode-choice">Mode
+        <select id="night-mode-choice" name="night_mode" aria-label="Night mode">{night_mode_options}</select>
+      </label>
+      <div class="field night-time">
+        <label for="night-start">Night starts</label>
+        <input id="night-start" name="night_start" type="time" value="{night_start}">
+      </div>
+      <div class="field night-time">
+        <label for="night-end">Night ends</label>
+        <input id="night-end" name="night_end" type="time" value="{night_end}">
+      </div>
+      <label class="field">Night OLED (%)
+        <input name="night_dim_percent" type="number" min="1" max="100" value="{night_dim_percent}" required>
+      </label>
+      <label class="field">Night volume limit (%)
+        <input name="night_volume_limit" type="number" min="1" max="100" value="{night_volume_limit}" required>
+      </label>
+    </div>
+  </fieldset>
+  <fieldset class="field-group divided-form">
+    <legend>Sleep timer</legend>
+    <label class="check-field"><input type="checkbox" name="sleep_timer_enabled" value="1"{sleep_checked}><span>Ask whether to keep listening</span></label>
+    <label class="field setting-form">Ask after (minutes of listening)
+      <input name="sleep_timer_minutes" type="number" min="{sleep_min}" max="{sleep_max}" value="{sleep_minutes}" required>
+    </label>
+    <label class="check-field"><input type="checkbox" name="sleep_rewind" value="1"{sleep_rewind_checked}><span>Rewind to the start of the sleep fade</span></label>
+  </fieldset>
+  <fieldset class="field-group divided-form">
+    <legend>Skips</legend>
+    <div class="field-grid">
+      <label class="field">Skip back (seconds)
+        <input name="skip_back_seconds" type="number" min="5" max="120" value="{skip_back_seconds}" required>
+      </label>
+      <label class="field">Skip forward (seconds)
+        <input name="skip_forward_seconds" type="number" min="5" max="120" value="{skip_forward_seconds}" required>
+      </label>
+    </div>
+  </fieldset>
+  <div class="form-footer"><button type="submit">Save listening settings</button></div>
+</form>

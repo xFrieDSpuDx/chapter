@@ -4,55 +4,160 @@ import argparse
 import hmac
 import html
 import json
+import os
+import re
 import secrets
 import subprocess
 import threading
 import time
-from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from dataclasses import asdict, replace
+from hashlib import sha256
+from http.server import ThreadingHTTPServer
 from typing import Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from . import __version__
-from .api import AudiobookshelfClient, AudiobookshelfError, client_from_config
+from .api import AudiobookshelfClient, AudiobookshelfError
+from .audio_output_test import AUDIO_TEST_COMMAND, AUDIO_TEST_OUTPUTS
+from .audio_output_views import render_audio_output
 from .bluetooth_audio import connected_bluetooth_audio_device
+from .book_details_views import book_metadata, render_book_details
+from .bookmarks import bookmarks_for_item
+from .build_info import log_installed_build
+from .catalogue_settings import (
+    CATALOGUE_COMMAND,
+    available_book_libraries,
+    catalogue_request_key,
+    catalogue_status_key,
+    format_last_refresh,
+    load_catalogue_status,
+)
+from .catalogue_views import render_catalogue_settings
 from .config import (
-    LIBRARY_SORT_AUTHOR,
-    LIBRARY_SORT_TITLE,
-    MAX_SLEEP_TIMER_MINUTES,
-    MIN_SLEEP_TIMER_MINUTES,
-    PLAYBACK_SPEEDS,
-    SCREEN_SAVER_BOOKS,
-    SCREEN_SAVER_CHAPTER,
-    SCREEN_SAVER_CLOCK,
-    SCREEN_SAVER_DIM_LEVELS,
+    NIGHT_MODES,
     AppConfig,
-    PodcastConfig,
     load_config,
+    same_login,
     save_config,
+    update_config,
+    valid_clock_time,
+    valid_feedback_volume,
     valid_library_sort_mode,
     valid_playback_speed,
-    valid_screen_saver_dim_percent,
-    valid_screen_saver_mode,
+    valid_skip_seconds,
     valid_sleep_timer_minutes,
 )
-from .library_cache import clear_cached_books
+from .connection_health import ConnectionMonitor
+from .device_preferences import (
+    save_click_setting,
+    save_playback_speed_setting,
+    save_screen_saver_setting,
+    save_sleep_timer_setting,
+    save_spoken_navigation_setting,
+)
+from .download_assets import read_details
+from .download_routes import change_download, change_download_settings, download_status_payload
+from .download_space import DownloadSpace
+from .download_store import (
+    book_directory,
+    books_with_downloads,
+    completed_download_ids,
+    read_download,
+    web_downloads,
+)
+from .download_views import (
+    download_space_label,
+    library_url,
+    render_library,
+)
+from .downloads import downloads
+from .library import available_shelves, series_key
+from .library_cache import clear_cached_books, load_cached_books
+from .listening_control import control_value
+from .listening_queue import edit_queue, read_queue
+from .listening_status import (
+    listening_details,
+    listening_progress,
+    listening_source,
+    matches_listening_account,
+)
+from .owner_auth import (
+    OwnerAccess,
+    OwnerSessions,
+    change_owner_login,
+    change_public_access,
+    session_cookie,
+)
+from .owner_views import render_owner_page, render_security_page
+from .player_control import (
+    WebPlayerStatus,
+    command_result,
+    load_web_player_status,
+    queue_web_player_command,
+)
 from .player_state import clear_last_playback
-from .player_control import WebPlayerStatus, load_web_player_status, queue_web_player_command
+from .player_views import render_player_page, render_player_queue
 from .podcast import PodcastError, resolve_podcast_config
+from .podcast_catalogue import load_podcast_catalogue
+from .progress_sync import progress_account, read_listening_progress
+from .settings_backup import (
+    BACKUP_VERSION,
+    BackupError,
+    apply_preview,
+    backup_payload,
+    preview_ticket,
+    read_backup,
+)
+from .settings_backup_views import render_settings_restore
+from .setup_http import SetupHTTPHandler, one
+from .setup_views import (
+    ASSET_DIR,
+    CSRF_FIELD_NAME,
+    SETTINGS_PAGES,
+    format_download_activity,
+    format_night_mode_status,
+    overview_listening_status,
+    render_bluetooth_status_value,
+    render_connection_health,
+    render_guest_overview,
+    render_health_page,
+    render_settings_page,
+    render_setup_page,
+    render_shelf_settings,
+    render_wifi_card,
+    render_wifi_status_value,
+    wifi_card_key,
+)
 from .software_update import (
     UPDATE_SERVICE_NAME,
     SoftwareUpdateState,
+    load_update_state,
     save_update_state,
+    update_state_is_active,
     update_status_payload,
+    version_tuple,
     wait_for_update_display_ready,
 )
+from .system_diagnostics import collect_system_diagnostics, diagnostic_payload
+from .system_status_views import render_system_status
+from .theme_views import render_themes_page
+from .web_artwork import fetch_artwork
+from .web_catalogue import CatalogueLoader
+from .web_device_status import BluetoothStatusCache, WifiStatusCache
+from .web_library import (
+    BROWSE_VIEWS,
+    browser_shelves,
+    find_library_book,
+    library_display_filters,
+    library_page,
+    shelf_groups,
+)
+from .web_player_events import player_status_payload, stream_player_events
+from .web_reads import WebReads
 from .wifi import (
     SETUP_HOTSPOT_SSID,
     SETUP_HOTSPOT_URL,
     WifiError,
-    WifiStatus,
     connect_wifi,
     ensure_wifi_or_hotspot,
     forget_all_wifi_connections_and_start_hotspot,
@@ -65,1205 +170,213 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 47831
 WIFI_CHANGE_DELAY_SECONDS = 5.0
 SYSTEM_ACTION_DELAY_SECONDS = 3.0
-PLAYER_EVENT_POLL_SECONDS = 0.25
-PLAYER_EVENT_TIME_SECONDS = 1.0
-PLAYER_EVENT_HEARTBEAT_SECONDS = 10.0
-MAX_POST_BODY_BYTES = 64 * 1024
-CSRF_FIELD_NAME = "csrf_token"
-LOGO_PATH = Path(__file__).resolve().parent / "assets" / "chapter-logo.png"
+LOGO_PATH = ASSET_DIR / "chapter-logo.png"
+connection_monitor = ConnectionMonitor()
+update_request_lock = threading.Lock()
+owner_sessions = OwnerSessions()
+web_catalogue = CatalogueLoader()
+web_bluetooth = BluetoothStatusCache()
+web_wifi = WifiStatusCache()
+web_reads = WebReads()
+download_space = DownloadSpace()
 
 
-PAGE = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="chapter-csrf-token" content="{csrf_token}">
-  <title>Chapter Player</title>
-  <link rel="icon" type="image/png" href="/assets/chapter-logo.png">
-  <style>
-    body {{
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 0;
-      min-height: 100vh;
-      background: #edf1ef;
-      color: #1f292b;
-    }}
-    main {{
-      width: min(92vw, 780px);
-      margin: 28px auto 48px;
-    }}
-    .app-header {{
-      display: flex;
-      justify-content: space-between;
-      gap: 24px;
-      align-items: center;
-      padding: 0 2px;
-    }}
-    .app-brand {{
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      min-width: 0;
-    }}
-    .app-logo {{
-      width: 84px;
-      height: 63px;
-      flex: 0 0 auto;
-      object-fit: contain;
-    }}
-    .app-intro {{
-      max-width: 500px;
-      margin: 0;
-      font-size: 0.95rem;
-    }}
-    .tabs {{
-      display: flex;
-      gap: 4px;
-      margin-top: 22px;
-      padding: 4px;
-      overflow-x: auto;
-      border: 1px solid #cfd9d6;
-      border-radius: 8px;
-      background: #f8faf9;
-      scrollbar-width: none;
-    }}
-    .tabs::-webkit-scrollbar {{ display: none; }}
-    .tab-button {{
-      width: auto;
-      min-width: 68px;
-      min-height: 42px;
-      flex: 1 0 auto;
-      margin: 0;
-      padding: 8px 4px;
-      border: 0;
-      border-radius: 6px;
-      background: transparent;
-      color: #586467;
-      font-size: 0.8rem;
-      font-weight: 750;
-      cursor: pointer;
-    }}
-    .tab-button:hover {{
-      background: #e9efed;
-      color: #1f292b;
-    }}
-    .tab-button.is-active {{
-      background: #234f50;
-      color: #fff;
-      box-shadow: 0 2px 7px rgba(26, 58, 59, 0.2);
-    }}
-    .tab-button:focus-visible,
-    button:focus-visible,
-    input:focus-visible,
-    select:focus-visible {{
-      outline: 3px solid #e8ad55;
-      outline-offset: 2px;
-    }}
-    .tab-panel {{
-      margin-top: 14px;
-    }}
-    .tab-panel[hidden] {{
-      display: none;
-    }}
-    .connection-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-    }}
-    .card {{
-      background: #fff;
-      border: 1px solid #d7dfdc;
-      border-radius: 8px;
-      padding: 24px;
-      margin: 0;
-      box-shadow: 0 10px 28px rgba(30, 49, 48, 0.09);
-    }}
-    h1 {{ margin: 0; font-size: 1.75rem; line-height: 1.15; }}
-    h2 {{ margin: 0 0 14px; font-size: 1.05rem; }}
-    p {{ color: #5d686b; line-height: 1.45; }}
-    label {{ display: block; margin-top: 16px; font-weight: 700; }}
-    input {{
-      box-sizing: border-box;
-      width: 100%;
-      min-height: 44px;
-      margin-top: 6px;
-      padding: 8px 10px;
-      border: 1px solid #b9c5c2;
-      border-radius: 6px;
-      font: inherit;
-    }}
-    button {{
-      width: 100%;
-      min-height: 48px;
-      margin-top: 22px;
-      border: 0;
-      border-radius: 6px;
-      background: #2e7d79;
-      color: #fff;
-      font: inherit;
-      font-weight: 800;
-      cursor: pointer;
-    }}
-    button:hover {{
-      background: #256c68;
-    }}
-    button:disabled {{
-      cursor: wait;
-      opacity: 0.65;
-    }}
-    .playback-form button {{
-      margin-top: 12px;
-    }}
-    .volume-form {{
-      margin-top: 12px;
-      display: grid;
-      grid-template-columns: 28px 1fr 52px;
-      gap: 10px;
-      align-items: center;
-    }}
-    .volume-icon {{
-      color: #20242a;
-      font-size: 1.2rem;
-      text-align: center;
-      line-height: 1;
-    }}
-    .volume-percent {{
-      color: #20242a;
-      font-weight: 800;
-      text-align: left;
-      white-space: nowrap;
-    }}
-    .volume-slider {{
-      padding: 0;
-      margin-top: 0;
-      min-height: 44px;
-      border: 0;
-      border-radius: 0;
-      accent-color: #2e7d79;
-    }}
-    .message {{
-      padding: 12px;
-      border-radius: 6px;
-      margin: 16px 0 0;
-      background: #eef7f5;
-      color: #164b47;
-    }}
-    .error {{
-      background: #fbebeb;
-      color: #842020;
-    }}
-    .hint {{
-      font-size: 0.92rem;
-    }}
-    .settings-list {{
-      margin-top: 12px;
-      border: 1px solid #dfe6e3;
-      border-radius: 8px;
-      overflow: hidden;
-    }}
-    .settings-row {{
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 16px;
-      align-items: center;
-      padding: 12px;
-      border-top: 1px solid #dfe6e3;
-    }}
-    .settings-row:first-child {{ border-top: 0; }}
-    .setting-name {{
-      font-weight: 800;
-    }}
-    .setting-state {{
-      color: #59616d;
-      font-size: 0.88rem;
-      margin-top: 3px;
-    }}
-    .toggle-form {{
-      margin: 0;
-    }}
-    .toggle-button {{
-      position: relative;
-      width: 54px;
-      height: 30px;
-      min-height: 30px;
-      margin: 0;
-      padding: 0;
-      display: block;
-      box-sizing: border-box;
-      border-radius: 999px;
-      background: #a9aea9;
-      overflow: hidden;
-    }}
-    .toggle-button::after {{
-      content: "";
-      position: absolute;
-      top: 4px;
-      left: 4px;
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: #fff;
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
-    }}
-    .toggle-button.is-on {{
-      background: #2e7d79;
-    }}
-    .toggle-button.is-on::after {{
-      left: 28px;
-    }}
-    .select-form {{
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      margin: 0;
-    }}
-    .settings-select {{
-      min-width: 150px;
-      border: 1px solid #d8d0c5;
-      border-radius: 8px;
-      padding: 8px 10px;
-      background: #fff;
-      color: #1f2933;
-      font: inherit;
-    }}
-    .screen-saver-settings-form {{
-      grid-column: 1 / -1;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) auto;
-      gap: 8px;
-      align-items: end;
-      margin: 2px 0 0;
-    }}
-    .screen-saver-settings-form label {{
-      margin: 0;
-      color: #59616d;
-      font-size: 0.82rem;
-    }}
-    .screen-saver-settings-form .settings-select {{
-      width: 100%;
-      min-width: 0;
-      margin-top: 4px;
-    }}
-    .settings-number {{
-      width: 76px;
-      min-height: 38px;
-      margin: 0;
-      padding: 7px 8px;
-    }}
-    .sleep-timer-content {{
-      min-width: 0;
-    }}
-    .sleep-timer-duration-form {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-      margin: 10px 0 0;
-      color: #59616d;
-      font-size: 0.88rem;
-    }}
-    .sleep-timer-duration-form .settings-number {{
-      width: 68px;
-    }}
-    .small-button {{
-      width: auto;
-      min-height: 36px;
-      padding: 8px 12px;
-      border-radius: 8px;
-      white-space: nowrap;
-    }}
-    .secondary {{
-      background: #e8eeec;
-      color: #20242a;
-    }}
-    .secondary:hover {{
-      background: #dce6e2;
-    }}
-    .podcast-form {{
-      margin-top: 12px;
-    }}
-    .podcast-table {{
-      display: grid;
-      gap: 10px;
-    }}
-    .podcast-row {{
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 10px;
-      align-items: end;
-      padding: 10px;
-      border: 1px solid #dfe6e3;
-      border-radius: 8px;
-      background: #f8faf9;
-    }}
-    .podcast-row input {{
-      margin-top: 0;
-    }}
-    .podcast-meta {{
-      color: #59616d;
-      font-size: 0.84rem;
-      margin-top: 5px;
-    }}
-    .podcast-actions {{
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      justify-content: space-between;
-      margin-top: 12px;
-    }}
-    .podcast-actions button {{
-      margin-top: 0;
-    }}
-    .podcast-save-button {{
-      width: auto;
-      min-width: 132px;
-    }}
-    .system-actions {{
-      border: 1px solid #dfe6e3;
-      border-radius: 8px;
-      overflow: hidden;
-    }}
-    .system-version {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: center;
-      gap: 16px;
-      margin-bottom: 16px;
-      padding: 14px 16px;
-      border: 1px solid #dfe6e3;
-      border-radius: 8px;
-      background: #f8faf9;
-    }}
-    .system-version-label {{
-      color: #59616d;
-      font-size: 0.9rem;
-    }}
-    .system-version-number {{
-      display: block;
-      margin-top: 2px;
-      font-size: 1.05rem;
-    }}
-    .system-update-status {{
-      display: block;
-      margin-top: 3px;
-      color: #59616d;
-      font-size: 0.82rem;
-      font-weight: 400;
-    }}
-    .system-update-description {{
-      margin: 5px 0 0;
-      font-size: 0.9rem;
-    }}
-    .system-version > button {{
-      width: auto;
-      min-width: 112px;
-      min-height: 40px;
-      margin: 0;
-      padding: 8px 14px;
-    }}
-    .system-version > .confirmation-panel {{
-      grid-column: 1 / -1;
-    }}
-    .system-action {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 14px;
-      align-items: center;
-      padding: 16px;
-      border-top: 1px solid #dfe6e3;
-    }}
-    .system-action:first-child {{
-      border-top: 0;
-    }}
-    .system-action h3 {{
-      margin: 0;
-      font-size: 1rem;
-    }}
-    .system-action p {{
-      margin: 5px 0 0;
-      font-size: 0.9rem;
-    }}
-    .system-action > button {{
-      width: auto;
-      min-width: 112px;
-      min-height: 40px;
-      margin: 0;
-      padding: 8px 14px;
-    }}
-    .danger-button {{
-      background: #a33a3a;
-    }}
-    .danger-button:hover {{
-      background: #872f2f;
-    }}
-    .confirmation-panel {{
-      grid-column: 1 / -1;
-      padding: 14px;
-      border: 1px solid #e5c6c6;
-      border-radius: 6px;
-      background: #fff7f7;
-    }}
-    .confirmation-panel.update-confirmation {{
-      border-color: #b9d4d0;
-      background: #f2f8f7;
-    }}
-    .confirmation-panel[hidden] {{
-      display: none;
-    }}
-    .confirmation-panel strong {{
-      display: block;
-    }}
-    .confirmation-actions {{
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-      margin-top: 12px;
-    }}
-    .confirmation-actions form {{
-      margin: 0;
-    }}
-    .confirmation-actions button {{
-      width: auto;
-      min-width: 96px;
-      min-height: 38px;
-      margin: 0;
-      padding: 8px 12px;
-    }}
-    .sr-only {{
-      position: absolute;
-      width: 1px;
-      height: 1px;
-      padding: 0;
-      margin: -1px;
-      overflow: hidden;
-      clip: rect(0, 0, 0, 0);
-      white-space: nowrap;
-      border: 0;
-    }}
-    .status {{
-      display: grid;
-      grid-template-columns: 1fr;
-      border: 1px solid #dfe6e3;
-      border-radius: 8px;
-      overflow: hidden;
-    }}
-    .status-row {{
-      display: grid;
-      grid-template-columns: minmax(140px, 180px) minmax(0, 1fr);
-      gap: 16px;
-      align-items: start;
-      padding: 14px 16px;
-      border-top: 1px solid #dfe6e3;
-    }}
-    .status-row:first-child {{ border-top: 0; }}
-    .status-row:last-child {{
-      padding: 16px;
-    }}
-    .status-label {{
-      color: #59616d;
-      font-size: 0.88rem;
-    }}
-    .status-value {{
-      min-width: 0;
-      overflow-wrap: anywhere;
-    }}
-    .status-value strong {{
-      font-weight: 800;
-    }}
-    .now-playing-title {{
-      font-weight: 800;
-    }}
-    .now-playing-meta {{
-      color: #59616d;
-      font-size: 0.92rem;
-      margin-top: 4px;
-    }}
-    .hidden {{ display: none; }}
-    .ok {{ color: #176c4f; }}
-    .bad {{ color: #9b2c2c; }}
-    code {{ background: #f1f1f1; padding: 2px 4px; border-radius: 4px; }}
-    @media (max-width: 680px) {{
-      main {{
-        width: min(94vw, 520px);
-        margin-top: 20px;
-      }}
-      .app-header {{
-        display: block;
-      }}
-      .app-intro {{
-        margin-top: 8px;
-      }}
-      .connection-grid {{
-        grid-template-columns: 1fr;
-      }}
-      .card {{
-        padding: 18px;
-      }}
-      .status {{
-        grid-template-columns: 1fr;
-      }}
-      .status-row,
-      .status-row:first-child {{
-        grid-template-columns: 1fr;
-        gap: 3px;
-        border-top: 1px solid #dfe6e3;
-      }}
-      .status-row:first-child {{
-        border-top: 0;
-      }}
-      .screen-saver-settings-form {{
-        grid-template-columns: 1fr;
-      }}
-      .podcast-row {{
-        grid-template-columns: 1fr;
-      }}
-      .podcast-row .small-button {{
-        width: 100%;
-      }}
-      .system-action {{
-        grid-template-columns: 1fr;
-      }}
-      .system-action > button {{
-        width: 100%;
-      }}
-      .system-version {{
-        grid-template-columns: 1fr;
-      }}
-      .system-version > button {{
-        width: 100%;
-      }}
-      .confirmation-actions {{
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-      }}
-      .confirmation-actions button {{
-        width: 100%;
-      }}
-    }}
-  </style>
-</head>
-<body>
-  <main>
-    <header class="app-header">
-      <div class="app-brand">
-        <img class="app-logo" src="/assets/chapter-logo.png" width="84" height="63" alt="">
-        <h1>Chapter Player</h1>
-      </div>
-    </header>
-    {message}
-    <nav class="tabs" role="tablist" aria-label="Player administration">
-      <button class="tab-button is-active" id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="panel-overview" data-tab-target="overview">Overview</button>
-      <button class="tab-button" id="tab-settings" type="button" role="tab" aria-selected="false" aria-controls="panel-settings" tabindex="-1" data-tab-target="settings">Settings</button>
-      <button class="tab-button" id="tab-podcasts" type="button" role="tab" aria-selected="false" aria-controls="panel-podcasts" tabindex="-1" data-tab-target="podcasts">Podcasts</button>
-      <button class="tab-button" id="tab-connections" type="button" role="tab" aria-selected="false" aria-controls="panel-connections" tabindex="-1" data-tab-target="connections">Setup</button>
-      <button class="tab-button" id="tab-system" type="button" role="tab" aria-selected="false" aria-controls="panel-system" tabindex="-1" data-tab-target="system">System</button>
-    </nav>
-    <div class="tab-panel" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" data-tab-panel="overview">
-      {status_panel}
-    </div>
-    <div class="tab-panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" data-tab-panel="settings" hidden>
-      {settings_card}
-    </div>
-    <div class="tab-panel" id="panel-podcasts" role="tabpanel" aria-labelledby="tab-podcasts" data-tab-panel="podcasts" hidden>
-      {podcasts_card}
-    </div>
-    <div class="tab-panel connection-grid" id="panel-connections" role="tabpanel" aria-labelledby="tab-connections" data-tab-panel="connections" hidden>
-      {wifi_card}
-      <section class="card" aria-labelledby="audiobookshelf-heading">
-        <h2 id="audiobookshelf-heading">Audiobookshelf</h2>
-        <p class="hint">The password is sent only to your Audiobookshelf server. This player stores the returned user token.</p>
-        <form method="post" action="/login">
-          {csrf_input}
-          <label for="server_url">Audiobookshelf server URL</label>
-          <input id="server_url" name="server_url" value="{server_url}" placeholder="https://books.example.com" required>
-
-          <label for="username">Username</label>
-          <input id="username" name="username" autocomplete="username" required>
-
-          <label for="password">Password</label>
-          <input id="password" name="password" type="password" autocomplete="current-password" required>
-
-          <button type="submit">Log In Player</button>
-        </form>
-      </section>
-    </div>
-    <div class="tab-panel" id="panel-system" role="tabpanel" aria-labelledby="tab-system" data-tab-panel="system" hidden>
-      {system_card}
-    </div>
-  </main>
-  <script>
-    var volumeSlider = document.querySelector("[data-volume-slider]");
-    var volumePercent = document.querySelector("[data-volume-percent]");
-    var playbackForm = document.querySelector("[data-playback-form]");
-    var podcastRows = document.querySelector("[data-podcast-rows]");
-    var addPodcastRowButton = document.querySelector("[data-add-podcast-row]");
-    var tabButtons = document.querySelectorAll("[data-tab-target]");
-    var tabPanels = document.querySelectorAll("[data-tab-panel]");
-    var confirmationTriggers = document.querySelectorAll("[data-confirm-trigger]");
-    var confirmationPanels = document.querySelectorAll("[data-confirm-panel]");
-    var volumeTimer = null;
-    var latestPlayerStatus = null;
-    var pendingPlaybackAction = null;
-    var sseStatusReceived = false;
-    var sseFallbackTimer = null;
-    var fallbackPollTimer = null;
-    var systemUpdatePollTimer = null;
-    var softwareUpdateWasInstalling = false;
-    var tabStorageKey = "chapter-admin-tab";
-    var csrfToken = document.querySelector('meta[name="chapter-csrf-token"]').getAttribute("content");
-    function tabExists(tabName) {{
-      return Boolean(document.querySelector('[data-tab-target="' + tabName + '"]'));
-    }}
-    function activateTab(tabName, moveFocus) {{
-      if (!tabExists(tabName)) {{
-        tabName = "overview";
-      }}
-      tabButtons.forEach(function(button) {{
-        var active = button.getAttribute("data-tab-target") === tabName;
-        button.classList.toggle("is-active", active);
-        button.setAttribute("aria-selected", active ? "true" : "false");
-        button.setAttribute("tabindex", active ? "0" : "-1");
-        if (active && moveFocus) {{
-          button.focus();
-        }}
-      }});
-      tabPanels.forEach(function(panel) {{
-        panel.hidden = panel.getAttribute("data-tab-panel") !== tabName;
-      }});
-      try {{
-        window.localStorage.setItem(tabStorageKey, tabName);
-      }} catch (error) {{}}
-    }}
-    function savedTab() {{
-      try {{
-        return window.localStorage.getItem(tabStorageKey) || "overview";
-      }} catch (error) {{
-        return "overview";
-      }}
-    }}
-    tabButtons.forEach(function(button, index) {{
-      button.addEventListener("click", function() {{
-        activateTab(button.getAttribute("data-tab-target"), false);
-      }});
-      button.addEventListener("keydown", function(event) {{
-        var nextIndex = index;
-        if (event.key === "ArrowRight") {{
-          nextIndex = (index + 1) % tabButtons.length;
-        }} else if (event.key === "ArrowLeft") {{
-          nextIndex = (index - 1 + tabButtons.length) % tabButtons.length;
-        }} else if (event.key === "Home") {{
-          nextIndex = 0;
-        }} else if (event.key === "End") {{
-          nextIndex = tabButtons.length - 1;
-        }} else {{
-          return;
-        }}
-        event.preventDefault();
-        activateTab(tabButtons[nextIndex].getAttribute("data-tab-target"), true);
-      }});
-    }});
-    activateTab(savedTab(), false);
-    function applySystemUpdateStatus(status) {{
-      var statusText = document.querySelector("[data-system-update-status]");
-      var description = document.querySelector("[data-system-update-description]");
-      var trigger = document.querySelector("[data-system-update-trigger]");
-      var versionText = document.querySelector("[data-system-update-version]");
-      var latestVersion = status.latestVersion ? "v" + status.latestVersion : "";
-      if (status.phase === "installing") {{
-        softwareUpdateWasInstalling = true;
-      }}
-      if (
-        softwareUpdateWasInstalling &&
-        (status.phase === "completed" || (status.phase === "current" && !status.updateAvailable))
-      ) {{
-        softwareUpdateWasInstalling = false;
-        window.location.replace("/");
-        return;
-      }}
-      var updateServiceIsRestarting = (
-        softwareUpdateWasInstalling && status.phase === "available" && status.updateAvailable
-      );
-      if (status.phase === "installing") {{
-        statusText.textContent = latestVersion ? "Installing " + latestVersion + "..." : "Installing update...";
-        description.textContent = status.message || "Installing the latest stable release. Chapter will restart its services when ready.";
-      }} else if (updateServiceIsRestarting) {{
-        statusText.textContent = "Finishing update...";
-        description.textContent = "Chapter is restarting with the newly installed version.";
-      }} else if (status.phase === "failed") {{
-        softwareUpdateWasInstalling = false;
-        statusText.textContent = "Update failed";
-        description.textContent = status.message || "The software update did not finish.";
-      }} else if (status.phase === "error") {{
-        statusText.textContent = softwareUpdateWasInstalling ? "Finishing update..." : "Update check needs attention";
-        description.textContent = softwareUpdateWasInstalling
-          ? "Waiting for the Chapter web service to restart."
-          : (status.message || "Chapter could not check for software updates.");
-      }} else if (status.updateAvailable) {{
-        statusText.textContent = latestVersion + " available";
-        description.textContent = "A newer stable version of Chapter is ready to install.";
-      }} else if (status.phase === "completed") {{
-        statusText.textContent = "Up to date";
-        description.textContent = "";
-      }} else {{
-        statusText.textContent = "Up to date";
-        description.textContent = "";
-      }}
-      description.hidden = !description.textContent.trim();
-      if (versionText) {{
-        versionText.textContent = latestVersion || "the latest release";
-      }}
-      if (trigger) {{
-        trigger.hidden = softwareUpdateWasInstalling || !status.updateAvailable;
-        trigger.textContent = latestVersion ? "Update to " + latestVersion : "Update";
-        if (trigger.hidden) {{
-          closeConfirmation("update", false);
-        }}
-      }}
-      if (systemUpdatePollTimer) {{
-        window.clearTimeout(systemUpdatePollTimer);
-      }}
-      systemUpdatePollTimer = window.setTimeout(
-        refreshSystemUpdateStatus,
-        softwareUpdateWasInstalling ? 2000 : (status.phase === "error" ? 5000 : 900000)
-      );
-    }}
-    function refreshSystemUpdateStatus() {{
-      var request = new XMLHttpRequest();
-      request.open("GET", "/system/update/status", true);
-      request.onreadystatechange = function() {{
-        if (request.readyState !== 4) {{
-          return;
-        }}
-        if (request.status === 200) {{
-          try {{
-            applySystemUpdateStatus(JSON.parse(request.responseText));
-            return;
-          }} catch (error) {{}}
-        }}
-        applySystemUpdateStatus({{
-          phase: "error",
-          latestVersion: "",
-          updateAvailable: false,
-          message: "Chapter could not check for software updates. It will try again automatically."
-        }});
-      }};
-      request.send();
-    }}
-    refreshSystemUpdateStatus();
-    function closeConfirmation(panelName, restoreFocus) {{
-      var panel = document.querySelector('[data-confirm-panel="' + panelName + '"]');
-      var trigger = document.querySelector('[data-confirm-trigger="' + panelName + '"]');
-      if (panel) {{
-        panel.hidden = true;
-      }}
-      if (trigger) {{
-        trigger.setAttribute("aria-expanded", "false");
-        if (restoreFocus) {{
-          trigger.focus();
-        }}
-      }}
-    }}
-    confirmationTriggers.forEach(function(trigger) {{
-      trigger.addEventListener("click", function() {{
-        var panelName = trigger.getAttribute("data-confirm-trigger");
-        confirmationPanels.forEach(function(panel) {{
-          closeConfirmation(panel.getAttribute("data-confirm-panel"), false);
-        }});
-        var panel = document.querySelector('[data-confirm-panel="' + panelName + '"]');
-        if (!panel) {{
-          return;
-        }}
-        panel.hidden = false;
-        trigger.setAttribute("aria-expanded", "true");
-        var cancelButton = panel.querySelector("[data-confirm-cancel]");
-        if (cancelButton) {{
-          cancelButton.focus();
-        }}
-      }});
-    }});
-    document.querySelectorAll("[data-confirm-cancel]").forEach(function(button) {{
-      button.addEventListener("click", function() {{
-        var panel = button.closest("[data-confirm-panel]");
-        if (panel) {{
-          closeConfirmation(panel.getAttribute("data-confirm-panel"), true);
-        }}
-      }});
-    }});
-    function encodeForm(fields) {{
-      var parts = [];
-      for (var key in fields) {{
-        if (Object.prototype.hasOwnProperty.call(fields, key)) {{
-          parts.push(encodeURIComponent(key) + "=" + encodeURIComponent(fields[key]));
-        }}
-      }}
-      return parts.join("&");
-    }}
-    function postPlayer(fields, callback) {{
-      var request = new XMLHttpRequest();
-      fields["{csrf_field_name}"] = csrfToken;
-      request.open("POST", "/player", true);
-      request.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
-      request.setRequestHeader("X-Requested-With", "fetch");
-      request.onreadystatechange = function() {{
-        if (request.readyState === 4 && callback) {{
-          callback(request.status);
-        }}
-      }};
-      request.send(encodeForm(fields));
-    }}
-    function sendVolume(value) {{
-      postPlayer({{action: "volume", volume: value}});
-    }}
-    function applyPlayerStatus(status) {{
-      latestPlayerStatus = status;
-      var playerContainer = document.querySelector("[data-now-playing]");
-      var title = document.querySelector("[data-now-playing-title]");
-      var meta = document.querySelector("[data-now-playing-meta]");
-      var actionInput = document.querySelector("[data-playback-action]");
-      var actionButton = document.querySelector("[data-playback-button]");
-      var playbackForm = document.querySelector("[data-playback-form]");
-      var volumeForm = document.querySelector("[data-volume-form]");
-      if (!status.hasSession) {{
-        pendingPlaybackAction = null;
-        if (playerContainer) {{
-          playerContainer.setAttribute("data-has-session", "0");
-        }}
-        if (title) {{
-          title.textContent = "Nothing playing";
-        }}
-        if (meta) {{
-          meta.textContent = "";
-        }}
-        if (playbackForm) {{
-          playbackForm.classList.add("hidden");
-        }}
-        if (volumeForm) {{
-          volumeForm.classList.add("hidden");
-        }}
-        return;
-      }}
-      if (playerContainer) {{
-        playerContainer.setAttribute("data-has-session", "1");
-      }}
-      if (playbackForm) {{
-        playbackForm.classList.remove("hidden");
-      }}
-      if (volumeForm) {{
-        volumeForm.classList.remove("hidden");
-      }}
-      if (title) {{
-        title.textContent = status.title;
-      }}
-      renderLivePlayerTime();
-      if (actionInput && actionButton) {{
-        if (pendingPlaybackAction) {{
-          var pendingReached = pendingPlaybackAction === "play" ? status.isPlaying : !status.isPlaying;
-          if (pendingReached) {{
-            pendingPlaybackAction = null;
-            actionButton.disabled = false;
-          }}
-        }}
-        if (pendingPlaybackAction) {{
-          actionButton.disabled = true;
-          actionButton.textContent = pendingPlaybackAction === "play" ? "Playing..." : "Pausing...";
-        }} else {{
-          actionInput.value = status.isPlaying ? "pause" : "play";
-          actionButton.textContent = status.isPlaying ? "Pause" : "Play";
-          actionButton.disabled = false;
-        }}
-      }}
-      if (volumeSlider && volumePercent && document.activeElement !== volumeSlider) {{
-        volumeSlider.value = status.volumePercent;
-        volumePercent.textContent = status.volumePercent + "%";
-      }}
-    }}
-    function twoDigit(value) {{
-      value = String(value);
-      return value.length < 2 ? "0" + value : value;
-    }}
-    function formatDuration(seconds) {{
-      seconds = Math.max(0, Math.floor(seconds || 0));
-      var hours = Math.floor(seconds / 3600);
-      var minutes = Math.floor((seconds % 3600) / 60);
-      var secs = seconds % 60;
-      if (hours) {{
-        return hours + ":" + twoDigit(minutes) + ":" + twoDigit(secs);
-      }}
-      return minutes + ":" + twoDigit(secs);
-    }}
-    function liveTimeInfo(status) {{
-      var currentTime = Number(status.currentTime || 0);
-      var duration = Number(status.duration || 0);
-      if (status.isPlaying) {{
-        var updatedAt = Number(status.updatedAt || 0);
-        if (updatedAt > 0) {{
-          currentTime += Math.max(0, Date.now() / 1000 - updatedAt);
-        }}
-      }}
-      if (duration > 0) {{
-        currentTime = Math.min(currentTime, duration);
-        return formatDuration(currentTime) + " / " + formatDuration(duration);
-      }}
-      return formatDuration(currentTime);
-    }}
-    function renderLivePlayerTime() {{
-      var meta = document.querySelector("[data-now-playing-meta]");
-      if (!meta || !latestPlayerStatus || !latestPlayerStatus.hasSession) {{
-        return;
-      }}
-      meta.textContent = latestPlayerStatus.state + " · " + liveTimeInfo(latestPlayerStatus);
-    }}
-    function setPendingPlayback(action) {{
-      var actionInput = document.querySelector("[data-playback-action]");
-      var actionButton = document.querySelector("[data-playback-button]");
-      pendingPlaybackAction = action;
-      if (actionInput && actionButton) {{
-        actionButton.disabled = true;
-        actionButton.textContent = action === "play" ? "Playing..." : "Pausing...";
-      }}
-    }}
-    function refreshPlayerStatus() {{
-      var request = new XMLHttpRequest();
-      request.open("GET", "/player/status?_=" + Date.now(), true);
-      request.onreadystatechange = function() {{
-        if (request.readyState !== 4) {{
-          return;
-        }}
-        if (request.status >= 200 && request.status < 300) {{
-          try {{
-            var status = JSON.parse(request.responseText);
-            applyPlayerStatus(status);
-          }} catch (error) {{}}
-        }}
-      }};
-      request.send();
-    }}
-    function startFallbackPolling() {{
-      if (fallbackPollTimer) {{
-        return;
-      }}
-      fallbackPollTimer = window.setInterval(refreshPlayerStatus, 1000);
-      refreshPlayerStatus();
-    }}
-    function startPlayerEventStream() {{
-      if (!window.EventSource) {{
-        startFallbackPolling();
-        return false;
-      }}
-      try {{
-        var source = new EventSource("/player/events");
-        source.onmessage = function(event) {{
-          try {{
-            applyPlayerStatus(JSON.parse(event.data));
-            sseStatusReceived = true;
-            if (sseFallbackTimer) {{
-              window.clearTimeout(sseFallbackTimer);
-              sseFallbackTimer = null;
-            }}
-          }} catch (error) {{
-            // Keep the fallback polling running.
-          }}
-        }};
-        source.onerror = function() {{
-          if (sseFallbackTimer) {{
-            window.clearTimeout(sseFallbackTimer);
-          }}
-          sseFallbackTimer = window.setTimeout(function() {{
-            if (!sseStatusReceived) {{
-              startFallbackPolling();
-            }}
-          }}, 4000);
-        }};
-        return true;
-      }} catch (error) {{
-        startFallbackPolling();
-        return false;
-      }}
-    }}
-    function sendPlayerAction(action) {{
-      postPlayer({{action: action}}, function() {{
-          window.setTimeout(refreshPlayerStatus, 250);
-          window.setTimeout(refreshPlayerStatus, 750);
-      }});
-    }}
-    function addPodcastRow(value) {{
-      if (!podcastRows) {{
-        return;
-      }}
-      var row = document.createElement("div");
-      row.className = "podcast-row";
-      var inputWrap = document.createElement("div");
-      var input = document.createElement("input");
-      input.name = "podcast_url";
-      input.type = "url";
-      input.placeholder = "https://podcasts.apple.com/...";
-      input.value = value || "";
-      var meta = document.createElement("div");
-      meta.className = "podcast-meta";
-      meta.textContent = "Paste a show link from podcasts.apple.com";
-      var remove = document.createElement("button");
-      remove.className = "small-button secondary";
-      remove.type = "button";
-      remove.textContent = "Remove";
-      remove.setAttribute("data-remove-podcast-row", "1");
-      inputWrap.appendChild(input);
-      inputWrap.appendChild(meta);
-      row.appendChild(inputWrap);
-      row.appendChild(remove);
-      podcastRows.appendChild(row);
-      attachPodcastRemoveButtons();
-      input.focus();
-    }}
-    function attachPodcastRemoveButtons() {{
-      var buttons = document.querySelectorAll("[data-remove-podcast-row]");
-      buttons.forEach(function(button) {{
-        if (button.getAttribute("data-bound") === "1") {{
-          return;
-        }}
-        button.setAttribute("data-bound", "1");
-        button.addEventListener("click", function() {{
-          var row = button.closest(".podcast-row");
-          if (row) {{
-            row.remove();
-          }}
-          if (podcastRows && !podcastRows.querySelector(".podcast-row")) {{
-            addPodcastRow("");
-          }}
-        }});
-      }});
-    }}
-    if (playbackForm) {{
-      playbackForm.addEventListener("submit", function(event) {{
-        event.preventDefault();
-        var actionInput = document.querySelector("[data-playback-action]");
-        var actionButton = document.querySelector("[data-playback-button]");
-        if (!actionInput) {{
-          return;
-        }}
-        setPendingPlayback(actionInput.value);
-        sendPlayerAction(actionInput.value);
-      }});
-    }}
-    if (volumeSlider && volumePercent) {{
-      volumeSlider.addEventListener("input", function() {{
-        volumePercent.textContent = volumeSlider.value + "%";
-        window.clearTimeout(volumeTimer);
-        volumeTimer = window.setTimeout(function() {{
-          sendVolume(volumeSlider.value);
-        }}, 120);
-      }});
-      volumeSlider.addEventListener("change", function() {{
-        window.clearTimeout(volumeTimer);
-        sendVolume(volumeSlider.value);
-      }});
-    }}
-    if (addPodcastRowButton) {{
-      addPodcastRowButton.addEventListener("click", function() {{
-        addPodcastRow("");
-      }});
-    }}
-    attachPodcastRemoveButtons();
-    startPlayerEventStream();
-    refreshPlayerStatus();
-    window.setInterval(renderLivePlayerTime, 1000);
-  </script>
-</body>
-</html>
-"""
+def download_activity_status(config: AppConfig) -> dict[str, str]:
+    completed = completed_download_ids(web_downloads(config))
+    activity = downloads.activity(config, completed)
+    return format_download_activity(
+        len(completed), activity.downloading, activity.in_queue,
+        download_space_label(download_space.reading(config).remaining),
+    )
 
 
-HEALTH_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Audiobookshelf Player Health</title>
-  <style>
-    body {{
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 0;
-      min-height: 100vh;
-      background: #f3f0e8;
-      color: #20242a;
-      display: grid;
-      place-items: center;
-    }}
-    main {{
-      width: min(92vw, 560px);
-      background: #fff;
-      border: 1px solid #d9d3c7;
-      border-radius: 8px;
-      padding: 24px;
-      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
-    }}
-    h1 {{ margin: 0 0 18px; font-size: 1.5rem; }}
-    .row {{
-      border-top: 1px solid #eee7dc;
-      padding: 16px 0;
-    }}
-    .label {{
-      color: #59616d;
-      font-size: 0.92rem;
-      margin-bottom: 4px;
-    }}
-    .value {{ font-size: 1.1rem; }}
-    .value strong {{ font-weight: 800; }}
-    .ok {{ color: #176c4f; }}
-    .bad {{ color: #9b2c2c; }}
-    code {{ background: #f1f1f1; padding: 2px 4px; border-radius: 4px; }}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Audiobookshelf Player Health</h1>
-    <div class="row">
-      <div class="label">Wi-Fi</div>
-      <div class="value {wifi_class}">{wifi_value}</div>
-    </div>
-    <div class="row">
-      <div class="label">Audiobookshelf</div>
-      <div class="value {abs_class}">{abs_value}</div>
-    </div>
-    <div class="row">
-      <div class="label">Software Version</div>
-      <div class="value"><strong>v{version}</strong></div>
-    </div>
-    <div class="row">
-      <div class="label">Setup Page</div>
-      <div class="value"><a href="/">Open setup</a></div>
-    </div>
-  </main>
-</body>
-</html>
-"""
+def guest_can_read(path: str, fields: dict[str, list[str]], sections: tuple[str, ...]) -> bool:
+    if "overview" in sections:
+        if path == "/status/overview" or (path == "/" and one(fields, "tab") in ("", "overview")):
+            return True
+    return "library" in sections and (
+        path in ("/library", "/library/details", "/library/download/status") or path.startswith("/artwork/")
+    )
 
 
-class SetupHandler(BaseHTTPRequestHandler):
+class SetupHandler(SetupHTTPHandler):
     server_version = f"ChapterPlayer/{__version__}"
     protocol_version = "HTTP/1.1"
 
-    def do_GET(self) -> None:
-        path = urlparse(self.path).path
+    def handle_get(self) -> None:
+        url = urlparse(self.path)
+        path = url.path
+        fields = parse_qs(url.query)
+        if path == "/owner":
+            self.send_owner_page(updated=one(fields, "updated") == "1")
+            return
         if path == "/assets/chapter-logo.png":
             self.send_logo_png()
             return
-        if path == "/player/events":
-            self.send_player_events()
-            return
+        access = owner_sessions.access(self.owner_cookie())
         if path == "/player/status":
-            self.send_player_status_json()
+            # The local updater uses the display timestamp to confirm an update.
+            if access.can_manage:
+                self.send_player_status_json()
+            else:
+                self.send_json({"displayDrawnAt": load_web_player_status().display_drawn_at})
             return
-        if path == "/system/update/status":
-            self.send_system_update_status_json()
+        guest_sections = None if access.can_manage else access.public_sections
+        if guest_sections is not None and not guest_can_read(path, fields, guest_sections):
+            if path == "/" and not one(fields, "tab") and "library" in guest_sections:
+                self.redirect_owner("/library")
+            else:
+                self.send_owner_required()
+            return
+        if path.startswith("/artwork/"):
+            self.send_artwork(path.removeprefix("/artwork/"), full=one(fields, "size") == "detail")
+            return
+        if path.startswith("/settings/"):
+            self.handle_settings_get(path, fields, access)
+            return
+        if path == "/player" or path.startswith("/player/"):
+            self.handle_player_get(path, fields)
+            return
+        if path.startswith("/system/"):
+            self.handle_system_get(path)
+            return
+        if path == "/status/downloads":
+            self.send_json(download_activity_status(load_config()))
+            return
+        if path == "/status/overview":
+            config = load_config()
+            summary = {**download_activity_status(config), "nightMode": format_night_mode_status(config)}
+            status = load_web_player_status()
+            if guest_sections is not None:
+                summary.update(overview_listening_status(status))
+            elif status.has_session:
+                progress = listening_progress(config, status)
+                label = progress.get("label", "") if progress.get("state") != "not_saved" else ""
+                summary["listeningSource"] = " · ".join(filter(None, (listening_source(status), label)))
+            else:
+                summary["listeningSource"] = ""
+            self.send_json(summary)
+            return
+        if path == "/status/wifi":
+            wifi = web_wifi.current(wifi_status)
+            data = {"label": render_wifi_status_value(wifi), "connected": wifi.connected if wifi else None}
+            if one(fields, "card") == "1":
+                data["cardKey"] = wifi_card_key(wifi)
+                data["card"] = render_wifi_card(wifi, self.csrf_token())
+            self.send_json(data)
+            return
+        if path == "/status/bluetooth":
+            connected, message = web_bluetooth.current(bluetooth_status)
+            self.send_json({"connected": connected, "label": render_bluetooth_status_value(message)})
+            return
+        if path == "/status/audiobookshelf":
+            self.send_html(200, render_connection_health(connection_monitor.status_for(load_config())))
             return
         if path == "/health":
             self.send_health_page()
             return
+        if path == "/library/details":
+            self.send_book_details(fields, guest_sections=guest_sections)
+            return
+        if path == "/library/download/status":
+            self.send_download_status(fields, can_manage=access.can_manage)
+            return
+        if path == "/library":
+            self.send_library(fields, guest_sections=guest_sections)
+            return
         if path != "/":
             self.send_error(404)
             return
-        self.send_page()
+        if guest_sections is not None:
+            config = load_config()
+            self.send_html(200, render_guest_overview(
+                config, load_web_player_status(), download_activity_status(config), guest_sections,
+            ))
+        else:
+            self.send_page(active_tab=one(fields, "tab"))
+
+    def handle_settings_get(self, path: str, fields: dict[str, list[str]], access: OwnerAccess) -> None:
+        if path == "/settings/security":
+            self.send_html(200, render_security_page(
+                self.csrf_token(), access.credential, saved=one(fields, "saved") == "1",
+            ))
+            return
+        if path == "/settings/themes":
+            self.send_html(200, render_themes_page())
+            return
+        section = path.removeprefix("/settings/")
+        if section in SETTINGS_PAGES:
+            self.send_html(200, render_settings_page(
+                load_config(), section, self.csrf_token(),
+                saved=one(fields, "saved") == "1",
+            ))
+            return
+        if path == "/settings/audio-output":
+            request_id = one(fields, "request")
+            if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+                request_id = ""
+            self.send_html(200, render_audio_output(
+                load_web_player_status(), bluetooth_status()[1], self.csrf_token(),
+                request_id, command_result(request_id) if request_id else "",
+            ))
+            return
+        if path == "/settings/shelves":
+            self.send_shelf_settings()
+            return
+        if path == "/settings/catalogue":
+            self.send_catalogue_settings(one(fields, "request")[:64])
+            return
+        if path == "/settings/catalogue/options":
+            self.send_catalogue_options()
+            return
+        if path == "/settings/catalogue/result":
+            self.send_catalogue_result(one(fields, "request")[:64])
+            return
+        self.send_error(404)
+
+    def handle_player_get(self, path: str, fields: dict[str, list[str]]) -> None:
+        if path == "/player/events":
+            self.send_player_events()
+            return
+        if path == "/player":
+            config = load_config()
+            status = load_web_player_status()
+            self.send_html(200, render_player_page(config, status, self.listening_queue_markup(config, status), self.csrf_token()))
+            return
+        if path == "/player/state":
+            self.send_listening_state()
+            return
+        if path == "/player/bookmarks":
+            self.send_player_bookmarks(one(fields, "session_key"), one(fields, "version")[:12])
+            return
+        if path == "/player/queue/status":
+            self.send_json({"markup": self.listening_queue_markup(load_config(), load_web_player_status())})
+            return
+        if path == "/player/command":
+            self.send_json({"outcome": command_result(one(fields, "id")), "observedAt": time.time()})
+            return
+        self.send_error(404)
+
+    def handle_system_get(self, path: str) -> None:
+        if path == "/system/update/status":
+            self.send_system_update_status_json()
+            return
+        if path == "/system/status":
+            self.send_html(200, render_system_status(collect_system_diagnostics(load_config())))
+            return
+        if path == "/system/settings-backup":
+            self.send_json(backup_payload(load_config()), attachment="chapter-settings.json")
+            return
+        if path == "/system/settings-restore":
+            self.send_html(200, render_settings_restore(self.csrf_token()))
+            return
+        if path == "/system/diagnostics":
+            self.send_json(
+                diagnostic_payload(collect_system_diagnostics(load_config())),
+                attachment="chapter-diagnostics.json",
+            )
+            return
+        self.send_error(404)
 
     def send_logo_png(self) -> None:
         body = LOGO_PATH.read_bytes()
@@ -1274,22 +387,62 @@ class SetupHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_POST(self) -> None:
+    def send_artwork(self, item_id: str, *, full: bool = False) -> None:
+        artwork = fetch_artwork(load_config(), item_id, full=full)
+        etag = f'"{sha256(artwork[1]).hexdigest()}"' if artwork else ""
+        unchanged = bool(etag and getattr(self, "headers", {}).get("If-None-Match") == etag)
+        self.send_response(304 if unchanged else 200 if artwork else 404)
+        self.send_header("Cache-Control", "private, no-cache" if artwork else "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if artwork:
+            self.send_header("ETag", etag)
+        if unchanged:
+            self.end_headers()
+            return
+        if artwork:
+            self.send_header("Content-Type", artwork[0])
+            self.send_header("Content-Length", str(len(artwork[1])))
+        else:
+            self.send_header("Content-Length", "0")
+        self.end_headers()
+        if artwork:
+            self.wfile.write(artwork[1])
+
+    def handle_post(self) -> None:
         path = urlparse(self.path).path
         handlers = {
+            "/owner/sign-in": self.handle_owner_sign_in,
+            "/owner/sign-out": self.handle_owner_sign_out,
+            "/settings/security/account": self.handle_owner_account_post,
+            "/settings/security/access": self.handle_visitor_access_post,
             "/wifi": self.handle_wifi_post,
             "/wifi/forget": self.handle_forget_wifi_post,
             "/player": self.handle_player_post,
+            "/player/control": self.handle_listening_control_post,
+            "/player/queue": self.handle_listening_queue_post,
+            "/settings/sound": self.handle_sound_settings_post,
+            "/settings/books": self.handle_book_settings_post,
+            "/settings/display": self.handle_display_settings_post,
             "/settings/click": self.handle_click_setting_post,
             "/settings/spoken-navigation": self.handle_spoken_navigation_setting_post,
             "/settings/library-order": self.handle_library_sort_setting_post,
+            "/settings/shelves": self.handle_shelf_setting_post,
+            "/settings/catalogue": self.handle_catalogue_post,
+            "/settings/downloads": self.handle_library_download_settings,
+            "/library/settings": self.handle_library_download_settings,
+            "/library/download": self.handle_library_download,
             "/settings/playback-speed": self.handle_playback_speed_setting_post,
             "/settings/screensaver": self.handle_screen_saver_setting_post,
+            "/settings/listening": self.handle_listening_setting_post,
             "/settings/sleep": self.handle_sleep_setting_post,
             "/podcasts": self.handle_podcasts_post,
             "/system/reboot": self.handle_system_reboot_post,
             "/system/update": self.handle_system_update_post,
             "/system/reset": self.handle_system_reset_post,
+            "/system/settings-preview": self.handle_settings_preview_post,
+            "/system/settings-restore": self.handle_settings_restore_post,
+            "/settings/night-mode": self.handle_night_mode_post,
+            "/settings/audio-test": self.handle_audio_test_post,
             "/login": self.handle_login_post,
         }
         handler = handlers.get(path)
@@ -1301,37 +454,107 @@ class SetupHandler(BaseHTTPRequestHandler):
         if fields is None:
             return
         submitted_token = one(fields, CSRF_FIELD_NAME)
-        if not submitted_token or not hmac.compare_digest(submitted_token, self.csrf_token()):
+        if not (
+            submitted_token and submitted_token.isascii()
+            and hmac.compare_digest(submitted_token, self.csrf_token())
+        ):
             self.send_csrf_error()
+            return
+        if path != "/owner/sign-in" and not self.owner_authorized():
+            self.send_owner_required()
             return
         handler()
 
+    def owner_cookie(self) -> str:
+        return getattr(self, "headers", {}).get("Cookie", "")
+
+    def owner_authorized(self) -> bool:
+        return owner_sessions.allows(self.owner_cookie())
+
+    def send_owner_required(self) -> None:
+        if getattr(self, "headers", {}).get("X-Requested-With") == "fetch":
+            self.send_json({"error": "Sign in to Chapter as owner."}, status=401)
+            return
+        self.redirect_owner("/owner")
+
+    def send_owner_page(self, *, error: str = "", status: int = 200, updated: bool = False) -> None:
+        access = owner_sessions.access(self.owner_cookie())
+        if access.unreadable:
+            error = "Owner access could not be read. Reset the owner password on the Pi."
+        self.send_html(status, render_owner_page(
+            self.csrf_token(), configured=access.credential is not None or access.unreadable,
+            signed_in=access.signed_in, error=error, updated=updated,
+            guest_sections=None if access.can_manage else access.public_sections,
+        ))
+
+    def handle_owner_sign_in(self) -> None:
+        fields = self.post_fields() or {}
+        token = owner_sessions.sign_in(one(fields, "username"), fields.get("password", [""])[0])
+        if token:
+            self.redirect_owner("/?tab=overview", cookie=session_cookie(token))
+        else:
+            self.send_owner_page(error="Could not sign in. Wait a moment and try again.", status=401)
+
+    def handle_owner_sign_out(self) -> None:
+        owner_sessions.sign_out(self.owner_cookie())
+        self.redirect_owner("/owner", cookie=session_cookie(""))
+
+    def handle_owner_account_post(self) -> None:
+        access = owner_sessions.access(self.owner_cookie())
+        if not access.can_manage:
+            self.send_owner_required()
+            return
+        fields = self.post_fields() or {}
+        password = fields.get("password", [""])[0]
+        try:
+            if password != fields.get("confirm_password", [""])[0]:
+                raise ValueError("The new passwords differ.")
+            change_owner_login(
+                one(fields, "username"), password, expected=access.credential,
+                current_password=fields.get("current_password", [""])[0],
+            )
+        except (OSError, ValueError) as error:
+            self.send_security_error(str(error) if isinstance(error, ValueError) else "Could not save the owner account.")
+            return
+        self.redirect_owner("/owner?updated=1", cookie=session_cookie(""))
+
+    def handle_visitor_access_post(self) -> None:
+        access = owner_sessions.access(self.owner_cookie())
+        if not access.can_manage:
+            self.send_owner_required()
+            return
+        if access.credential is None:
+            self.send_security_error("Set up the owner account first.")
+            return
+        fields = self.post_fields() or {}
+        try:
+            change_public_access(
+                access.credential, overview=one(fields, "public_overview") == "1",
+                library=one(fields, "public_library") == "1",
+            )
+        except (OSError, ValueError) as error:
+            self.send_security_error(str(error) if isinstance(error, ValueError) else "Could not save visitor access.")
+            return
+        self.redirect_settings("security")
+
+    def send_security_error(self, message: str) -> None:
+        access = owner_sessions.access(self.owner_cookie())
+        if access.can_manage:
+            self.send_html(400, render_security_page(self.csrf_token(), access.credential, error=message))
+        else:
+            self.send_owner_required()
+
+    def redirect_owner(self, location: str, *, cookie: str = "") -> None:
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def csrf_token(self) -> str:
         return getattr(getattr(self, "server", None), "csrf_token", "")
-
-    def post_fields(self) -> dict[str, list[str]] | None:
-        cached = getattr(self, "_post_fields", None)
-        if cached is not None:
-            return cached
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except (TypeError, ValueError):
-            self.send_request_error(400, "Invalid request length.")
-            return None
-        if length < 0:
-            self.send_request_error(400, "Invalid request length.")
-            return None
-        if length > MAX_POST_BODY_BYTES:
-            self.send_request_error(413, "Request is too large.")
-            return None
-        try:
-            body = self.rfile.read(length).decode("utf-8")
-        except UnicodeDecodeError:
-            self.send_request_error(400, "Request must use UTF-8 text.")
-            return None
-        fields = parse_qs(body, keep_blank_values=True)
-        self._post_fields = fields
-        return fields
 
     def handle_wifi_post(self) -> None:
         fields = self.post_fields()
@@ -1341,7 +564,7 @@ class SetupHandler(BaseHTTPRequestHandler):
         password = one(fields, "wifi_password")
 
         if not ssid:
-            self.send_page(message="Wi-Fi network name is required.", is_error=True)
+            self.send_page(message="Wi-Fi network name is required.", is_error=True, active_tab="connections")
             return
 
         schedule_wifi_connect(ssid, password)
@@ -1349,7 +572,8 @@ class SetupHandler(BaseHTTPRequestHandler):
             message=(
                 "Wi-Fi change submitted. The player will switch networks in a moment. "
                 "Hold the volume knob for 10 seconds to show the new setup address."
-            )
+            ),
+            active_tab="connections",
         )
 
     def handle_forget_wifi_post(self) -> None:
@@ -1358,7 +582,8 @@ class SetupHandler(BaseHTTPRequestHandler):
             message=(
                 f"Wi-Fi forget submitted. In about 5 seconds, connect to "
                 f"{html.escape(SETUP_HOTSPOT_SSID)}, then browse to {html.escape(SETUP_HOTSPOT_URL)}."
-            )
+            ),
+            active_tab="connections",
         )
 
     def handle_login_post(self) -> None:
@@ -1376,14 +601,14 @@ class SetupHandler(BaseHTTPRequestHandler):
                 message=f"Login failed: {html.escape(str(error))}",
                 is_error=True,
                 server_url=server_url,
-                library_id="",
+                active_tab="connections",
             )
             return
 
         self.send_page(
             message="Player login saved. You can close this page and restart the player.",
             server_url=saved_config.server_url,
-            library_id=saved_config.library_id,
+            active_tab="connections",
         )
 
     def handle_player_post(self) -> None:
@@ -1392,9 +617,22 @@ class SetupHandler(BaseHTTPRequestHandler):
             return
         action = one(fields, "action")
 
+        if action == "pause_book":
+            config = load_config()
+            item_id = one(fields, "book_id")
+            status = load_web_player_status()
+            if not config.is_ready or not item_id or status.cover_item_id != item_id:
+                self.send_json({"error": "Chapter is playing a different book."}, status=409)
+                return
+            command = queue_web_player_command("pause_book", catalogue_key=catalogue_request_key(config), book_id=item_id)
+            self.send_player_command_response(command.id)
+            return
+        if action == "play_book":
+            series = one(fields, "group") if one(fields, "view") == "series" else ""
+            self.handle_play_on_chapter(fields, series=series)
+            return
         if action in {"play", "pause"}:
-            queue_web_player_command(action)
-            self.send_player_command_response()
+            self.send_player_command_response(queue_web_player_command(action).id)
             return
 
         if action == "volume":
@@ -1403,55 +641,495 @@ class SetupHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self.send_page(message="Volume must be between 0 and 100.", is_error=True)
                 return
-            queue_web_player_command("volume", volume)
-            self.send_player_command_response()
+            self.send_player_command_response(queue_web_player_command("volume", volume).id)
             return
 
         self.send_page(message="Unknown player command.", is_error=True)
+
+    def send_listening_state(self) -> None:
+        status = load_web_player_status()
+        config = load_config()
+        matching_account = matches_listening_account(config, status)
+        self.send_json({
+            **player_status_payload(status),
+            **listening_details(status),
+            "sessionKey": status.session_key if matching_account else "",
+            "source": listening_source(status),
+            "output": {"speaker": "Speaker", "bluetooth": "Bluetooth"}.get(status.audio_output, ""),
+            "muted": status.muted,
+            "speed": round((status.playback_rate if status.session_key else config.playback_speed) * 100),
+            "skipBack": config.skip_back_seconds,
+            "skipForward": config.skip_forward_seconds,
+            "canBookmark": bool(status.account and matching_account and not status.episode_id),
+            "progress": listening_progress(config, status) or None,
+        })
+
+    def handle_listening_control_post(self) -> None:
+        fields = self.post_fields() or {}
+        key = one(fields, "session_key")
+        status = load_web_player_status()
+        config = load_config()
+        action = one(fields, "action")
+        if action == "cancel_open":
+            # A Library click can be cancelled before the OLED publishes its opening status.
+            if len(key) != 32 or any(char not in "0123456789abcdef" for char in key):
+                self.send_json({"error": "This opening request has changed."}, status=409)
+                return
+            self.send_player_command_response(queue_web_player_command(
+                action, session_key=key, catalogue_key=catalogue_status_key(config),
+            ).id)
+            return
+        if not key or key != status.session_key or not matches_listening_account(config, status):
+            self.send_json({"error": "The active book has changed. Try again."}, status=409)
+            return
+        try:
+            value = control_value(action, one(fields, "value"), status)
+        except (ValueError, OverflowError):
+            self.send_json({"error": "That playback control or value is unavailable."}, status=400)
+            return
+        self.send_player_command_response(queue_web_player_command(
+            action, value, session_key=key, catalogue_key=catalogue_status_key(config),
+        ).id)
+
+    def send_player_bookmarks(self, key: str, version: str = "") -> None:
+        status = load_web_player_status()
+        config = load_config()
+        if not key or key != status.session_key or status.episode_id or not status.account or status.account != progress_account(config):
+            self.send_json({"error": "Bookmarks are unavailable for the active book."}, status=409)
+            return
+        rows, pending = web_reads.get(
+            ("player-bookmarks", key, version),
+            lambda: bookmarks_for_item(config, status.cover_item_id, status.duration),
+        )
+        if rows is None and not pending:
+            self.send_json({"error": "Could not load bookmarks from Audiobookshelf."}, status=503)
+            return
+        self.send_json({"pending": pending, "bookmarks": [asdict(bookmark) for bookmark in rows or []]})
+
+    def listening_queue_markup(self, config: AppConfig, status: WebPlayerStatus) -> str:
+        order = read_queue(catalogue_status_key(config))
+        active = ""
+        if status.account == progress_account(config) and status.library_id == config.library_id and not status.episode_id:
+            active = status.cover_item_id
+        books = []
+        if config.is_ready and (active or order.items):
+            books = books_with_downloads(config, load_cached_books(config), copies=web_downloads(config))
+        return render_player_queue(order, books, active, self.csrf_token(), listening_details(status).get("series", ""))
+
+    def handle_listening_queue_post(self) -> None:
+        fields = self.post_fields() or {}
+        action = one(fields, "action")
+        item = one(fields, "book_id")
+        config = load_config()
+        key = catalogue_status_key(config)
+        if not config.is_ready or action not in {"add", "remove", "up", "down", "auto", "play"}:
+            self.send_listening_error(400, "Choose an action for your Audiobookshelf listening queue.")
+            return
+        if action == "play":
+            self.handle_play_on_chapter(fields, series=one(fields, "series"))
+            return
+        if action == "add" and not any(
+            book.id == item and not book.episode_id and not book.id.startswith("podcast:")
+            for book in books_with_downloads(config, load_cached_books(config))
+        ):
+            self.send_listening_error(404, "This book is not in the current library.")
+            return
+        try:
+            edit_queue(key, action, one(fields, "enabled") if action == "auto" else item)
+        except ValueError as error:
+            self.send_listening_error(409, str(error))
+            return
+        except OSError:
+            self.send_listening_error(503, "Could not save the listening queue. Try again.")
+            return
+        if self.headers.get("X-Requested-With") == "fetch":
+            self.send_json({"saved": True})
+        else:
+            self.send_response(303)
+            self.send_header("Location", "/player#listening-queue")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def send_listening_error(self, status: int, message: str) -> None:
+        if self.headers.get("X-Requested-With") == "fetch":
+            self.send_json({"error": message}, status=status)
+        else:
+            self.send_request_error(status, message)
+
+    def handle_play_on_chapter(self, fields: dict[str, list[str]], *, series: str = "") -> None:
+        item_id = one(fields, "book_id")
+        config = load_config()
+        book = next((
+            book for book in books_with_downloads(config, load_cached_books(config))
+            if book.id == item_id and not book.episode_id and not book.id.startswith("podcast:")
+        ), None) if config.is_ready else None
+        if book is None:
+            message = "Choose a book from the current library."
+            if getattr(self, "headers", {}).get("X-Requested-With") == "fetch":
+                self.send_json({"error": message}, status=409)
+            else:
+                self.send_request_error(409, message)
+            return
+        command = queue_web_player_command(
+            "play_book", catalogue_key=catalogue_request_key(config), book_id=book.id,
+            resume_time=book.current_time,
+            local_only=library_display_filters(fields)["section"] == "downloads" and (
+                one(fields, "downloaded") == "1" or book.downloaded
+            ),
+            **({"series": series} if series and any(series_key(member) == series for member in book.series) else {}),
+        )
+        self.send_player_command_response(command.id)
+
+    def handle_sound_settings_post(self) -> None:
+        fields = self.post_fields() or {}
+        update_config(lambda config: replace(
+            config,
+            control_click_enabled=one(fields, "control_click_enabled") == "1",
+            spoken_navigation_enabled=one(fields, "spoken_navigation_enabled") == "1",
+            control_click_volume_percent=valid_feedback_volume(
+                one(fields, "control_click_volume_percent"), config.control_click_volume_percent,
+            ),
+            spoken_navigation_volume_percent=valid_feedback_volume(
+                one(fields, "spoken_navigation_volume_percent"), config.spoken_navigation_volume_percent,
+            ),
+        ))
+        self.redirect_settings("sound")
+
+    def handle_book_settings_post(self) -> None:
+        fields = self.post_fields() or {}
+        previous, updated = update_config(lambda config: replace(
+            config,
+            library_sort_mode=valid_library_sort_mode(one(fields, "library_sort_mode")),
+            playback_speed=valid_playback_speed(one(fields, "playback_speed")),
+        ))
+        if previous.library_sort_mode != updated.library_sort_mode:
+            queue_web_player_command("resort_library")
+        self.redirect_settings("books")
+
+    def handle_display_settings_post(self) -> None:
+        fields = self.post_fields()
+        if fields is None:
+            return
+        try:
+            save_screen_saver_setting(
+                one(fields, "screen_saver_mode"), one(fields, "screen_saver_dim_percent"),
+                clock_format=one(fields, "screen_saver_clock_format"),
+                screen_off_minutes=one(fields, "screen_off_minutes") if "screen_off_minutes" in fields else None,
+                screen_off_hours=(one(fields, "screen_off_start"), one(fields, "screen_off_end"))
+                if "screen_off_start" in fields or "screen_off_end" in fields else None,
+            )
+        except ValueError as error:
+            self.send_html(400, render_settings_page(load_config(), "display", self.csrf_token(), error=str(error)))
+            return
+        self.redirect_settings("display")
 
     def handle_click_setting_post(self) -> None:
         fields = self.post_fields()
         if fields is None:
             return
-        enabled = one(fields, "enabled") == "1"
-        save_click_setting(enabled)
-        self.redirect_home()
+        if "volume_percent" in fields:
+            save_click_setting(volume_percent=one(fields, "volume_percent"))
+        else:
+            save_click_setting(one(fields, "enabled") == "1")
+        self.redirect_home("settings")
 
     def handle_spoken_navigation_setting_post(self) -> None:
         fields = self.post_fields()
         if fields is None:
             return
-        enabled = one(fields, "enabled") == "1"
-        save_spoken_navigation_setting(enabled)
-        self.redirect_home()
+        if "volume_percent" in fields:
+            save_spoken_navigation_setting(volume_percent=one(fields, "volume_percent"))
+        else:
+            save_spoken_navigation_setting(one(fields, "enabled") == "1")
+        self.redirect_home("settings")
 
     def handle_library_sort_setting_post(self) -> None:
         fields = self.post_fields()
         if fields is None:
             return
         save_library_sort_setting(one(fields, "library_sort_mode"))
-        self.redirect_home()
+        self.redirect_home("settings", anchor="book-preferences")
+
+    def handle_audio_test_post(self) -> None:
+        output = AUDIO_TEST_OUTPUTS.get(one(self.post_fields() or {}, "output"))
+        if output is None:
+            self.send_request_error(400, "Choose the speaker or Bluetooth output.")
+            return
+        command = queue_web_player_command(AUDIO_TEST_COMMAND, output)
+        self.send_response(303)
+        self.send_header("Location", "/settings/audio-output?" + urlencode({"request": command.id}))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def handle_night_mode_post(self) -> None:
+        mode = one(self.post_fields() or {}, "mode")
+        if mode not in NIGHT_MODES:
+            self.send_request_error(400, "Choose Automatic, On or Off.")
+            return
+        update_config(lambda current: replace(current, night_mode=mode))
+        self.redirect_home("settings", anchor="night-mode")
+
+    def handle_settings_preview_post(self) -> None:
+        raw = one(self.post_fields() or {}, "backup")
+        try:
+            values = read_backup(raw)
+        except BackupError as error:
+            self.send_html(400, render_settings_restore(self.csrf_token(), notice=str(error)))
+            return
+
+        current = load_config()
+        shelf = values.get("pinned_shelf")
+        label = ""
+        notice = ""
+        if shelf and shelf != current.pinned_shelf:
+            if current.is_ready:
+                try:
+                    label = next((option.label for option in available_shelves(current) if option.key == shelf), "")
+                except AudiobookshelfError:
+                    pass
+            if not label:
+                del values["pinned_shelf"]
+                notice = "Pinned shelf skipped. Sign in to the same library and preview the backup again to restore it."
+        raw = json.dumps({"version": BACKUP_VERSION, "settings": values})
+        self.send_html(200, render_settings_restore(
+            self.csrf_token(), values=values, current=current, raw=raw,
+            ticket=preview_ticket(current, raw), shelf_label=label, notice=notice,
+        ))
+
+    def handle_settings_restore_post(self) -> None:
+        fields = self.post_fields() or {}
+        try:
+            previous, updated = apply_preview(one(fields, "backup"), one(fields, "preview"))
+        except BackupError as error:
+            self.send_html(400, render_settings_restore(self.csrf_token(), notice=str(error)))
+            return
+        if previous.library_sort_mode != updated.library_sort_mode:
+            queue_web_player_command("resort_library")
+        if previous.pinned_shelf != updated.pinned_shelf:
+            queue_web_player_command("reload_catalogue")
+        self.send_html(200, render_settings_restore(
+            self.csrf_token(), restored=True, notice="Your settings were restored.",
+        ))
+
+    def send_shelf_settings(self) -> None:
+        config = load_config()
+        if not config.is_ready:
+            self.send_request_error(409, "Sign in to Audiobookshelf before choosing a shelf.")
+            return
+        try:
+            shelves = available_shelves(config)
+        except AudiobookshelfError:
+            self.send_request_error(503, "Audiobookshelf shelves are unavailable. Try again from Settings.")
+            return
+        self.send_html(200, render_shelf_settings(shelves, config.pinned_shelf, self.csrf_token()))
+
+    def send_catalogue_settings(self, request_id: str) -> None:
+        config = load_config()
+        self.send_html(200, render_catalogue_settings(
+            config, load_catalogue_status(config), self.csrf_token(), request_id
+        ))
+
+    def send_catalogue_options(self) -> None:
+        config = load_config()
+        if not config.is_ready:
+            self.send_json({"error": "Sign in to Audiobookshelf first."})
+            return
+        try:
+            options = available_book_libraries(config)
+        except (AudiobookshelfError, OSError, ValueError):
+            self.send_json({"error": "Audiobookshelf libraries are unavailable. Check the connection and reload."})
+            return
+        self.send_json({"libraries": [{"id": option.id, "name": option.name} for option in options]})
+
+    def send_catalogue_result(self, request_id: str) -> None:
+        config = load_config()
+        status = load_catalogue_status(config)
+        self.send_json({
+            "outcome": command_result(request_id),
+            "lastRefresh": format_last_refresh(status),
+            "error": status.error + "." if status.error else "",
+            "libraryId": config.library_id,
+            "libraryName": config.library_name,
+            "catalogueKey": catalogue_request_key(config) if config.is_ready else "",
+        })
+
+    def handle_catalogue_post(self) -> None:
+        fields = self.post_fields()
+        if fields is None:
+            return
+        config = load_config()
+        if not config.is_ready:
+            self.send_request_error(409, "Sign in to Audiobookshelf first.")
+            return
+        key = catalogue_request_key(config)
+        if one(fields, "catalogue_key") != key:
+            self.send_request_error(409, "The library settings changed. Reopen the library picker and try again.")
+            return
+        action = one(fields, "action")
+        library_id = one(fields, "library_id") if action == "select" else ""
+        if action not in ("select", "refresh") or (action == "select" and not 0 < len(library_id) <= 200):
+            self.send_request_error(400, "Choose an audiobook library.")
+            return
+        command = queue_web_player_command(CATALOGUE_COMMAND, catalogue_key=key, library_id=library_id)
+        self.send_response(303)
+        self.send_header("Location", "/settings/catalogue?" + urlencode({"request": command.id}))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def send_library(self, fields: dict[str, list[str]], *, guest_sections: tuple[str, ...] | None = None) -> None:
+        config = load_config()
+        view = one(fields, "view")
+        view = view if view in BROWSE_VIEWS else "titles"
+        group = one(fields, "group")[:240]
+        group_view = one(fields, "group_view")
+        if group_view and group_view != view:
+            group = ""
+        downloaded_only = one(fields, "downloaded") == "1"
+        filters = library_display_filters(fields)
+        books = load_cached_books(config)
+        catalogue_total = len(books)
+        pending = False
+        notice = ""
+        if not books and config.is_ready and not downloaded_only and view != "podcasts":
+            state = web_catalogue.request(config)
+            pending = state == "loading"
+            if pending:
+                notice = "Loading library from Audiobookshelf…"
+            elif state == "save_failed":
+                notice = "Could not save the catalogue on the player. Check its available storage and try again."
+            elif state == "failed":
+                notice = "Could not load the library. Check the Audiobookshelf connection."
+
+        copies = web_downloads(config)
+        shelves = None
+        if view == "podcasts" and not downloaded_only:
+            episodes, waiting = web_reads.get(library_read_key(config, view), lambda: load_podcast_catalogue(config))
+            books = [replace(book) for book in episodes] if episodes is not None else []
+            pending = pending or waiting
+            if episodes is None:
+                notice = "Loading podcasts…" if waiting else "Podcasts are unavailable."
+        else:
+            books = books_with_downloads(config, books, include_incomplete=True, copies=copies)
+        if view in ("collections", "playlists") and config.is_ready:
+            rows, waiting = web_reads.get(library_read_key(config, view), lambda: browser_shelves(config, view))
+            shelves = shelf_groups(config, view, books, rows=rows or [])
+            pending = pending or waiting
+            if rows is None:
+                notice = "Loading shelves…" if waiting else "Audiobookshelf shelves are unavailable."
+        if books:
+            account = progress_account(config)
+            updates = read_listening_progress() if account else {}
+            for book in books:
+                update = updates.get((account, book.id, ""))
+                if update and update.updated_at >= book.progress_updated_at:
+                    book.current_time = update.current_time
+                    book.progress_updated_at = update.updated_at
+                    book.progress = min(1, update.current_time / update.duration) if update.duration else 0
+                    book.is_finished = book.progress >= .995
+        can_manage = guest_sections is None
+        self.send_html(200, render_library(
+            config, books, one(fields, "q")[:200], downloaded_only, library_page(fields),
+            self.csrf_token() if can_manage else "",
+            view=view, group=group, shelves=shelves, notice=notice, copies=copies,
+            catalogue_total=catalogue_total, catalogue_pending=pending,
+            player=load_web_player_status() if can_manage else None, guest_sections=guest_sections,
+            space_remaining=download_space.reading(config).remaining if filters["section"] == "downloads" else None,
+            fragment=getattr(self, "headers", {}).get("X-Chapter-Fragment") == "results", **filters,
+        ))
+
+    def send_book_details(self, fields: dict[str, list[str]], *, guest_sections: tuple[str, ...] | None = None) -> None:
+        config = load_config()
+        item_id = one(fields, "id")
+        directory = book_directory(config, item_id)
+        record = read_download(directory) if config.is_ready and item_id else None
+        book = record.book if record else find_library_book(config, item_id)
+        if book is None:
+            self.send_request_error(404, "This book is not in the current library.")
+            return
+        metadata = read_details(directory) if record else None
+        pending = False
+        if metadata is None and not (record and record.complete):
+            metadata, pending = web_reads.get(
+                ("details", progress_account(config), item_id), lambda: book_metadata(config, book),
+            )
+        self.send_html(200, render_book_details(
+            book, metadata or {}, pending=pending,
+            fragment=getattr(self, "headers", {}).get("X-Chapter-Fragment") == "details",
+            guest_sections=guest_sections,
+            section="downloads" if one(fields, "section") == "downloads" else "library",
+            csrf=self.csrf_token() if guest_sections is None else "",
+        ))
+
+    def handle_library_download_settings(self) -> None:
+        change_download_settings(self)
+
+    def handle_library_download(self) -> None:
+        change_download(self, download_space)
+
+    def send_download_status(self, fields: dict[str, list[str]], *, can_manage: bool = True) -> None:
+        config = load_config()
+        csrf = self.csrf_token() if can_manage else None
+        payload = download_status_payload(config, fields, csrf=csrf, space=download_space)
+        if one(fields, "catalogue_pending") == "1":
+            pending_lookup = web_reads.pending(library_read_key(config, one(fields, "view")))
+            payload["cataloguePending"] = web_catalogue.pending(config) or pending_lookup
+        self.send_json(payload)
+
+    def redirect_library(self, fields: dict[str, list[str]]) -> None:
+        self.send_response(303)
+        self.send_header("Location", library_url(one(fields, "q")[:200], one(fields, "downloaded") == "1",
+                                                 library_page(fields), view=one(fields, "view") or "titles",
+                                                 group=one(fields, "group")[:240], **library_display_filters(fields)))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def handle_shelf_setting_post(self) -> None:
+        fields = self.post_fields()
+        if fields is None:
+            return
+        shelf = one(fields, "shelf")
+        config = load_config()
+        try:
+            if shelf and (not config.is_ready or shelf not in {row.key for row in available_shelves(config)}):
+                self.send_request_error(400, "Choose an accessible collection or playlist.")
+                return
+        except AudiobookshelfError:
+            self.send_request_error(503, "Audiobookshelf shelves are unavailable. Try again from Settings.")
+            return
+        def pin(current: AppConfig) -> AppConfig:
+            if catalogue_request_key(current) != catalogue_request_key(config):
+                raise ValueError("The selected library changed")
+            return replace(current, pinned_shelf=shelf)
+
+        try:
+            update_config(pin)
+        except ValueError:
+            self.send_request_error(409, "The library changed. Choose the shelf again.")
+            return
+        queue_web_player_command("reload_catalogue")
+        self.redirect_home("settings", anchor="book-preferences")
 
     def handle_playback_speed_setting_post(self) -> None:
         fields = self.post_fields()
         if fields is None:
             return
         save_playback_speed_setting(one(fields, "playback_speed"))
-        self.redirect_home()
+        self.redirect_home("settings", anchor="book-preferences")
 
     def handle_screen_saver_setting_post(self) -> None:
         fields = self.post_fields()
         if fields is None:
             return
-        mode = valid_screen_saver_mode(one(fields, "screen_saver_mode"))
-        if "screen_saver_dim_percent" in fields:
-            save_screen_saver_setting(
-                mode,
-                valid_screen_saver_dim_percent(one(fields, "screen_saver_dim_percent")),
-            )
-        else:
-            save_screen_saver_setting(mode)
-        self.redirect_home()
+        save_screen_saver_setting(
+            one(fields, "screen_saver_mode"),
+            one(fields, "screen_saver_dim_percent") if "screen_saver_dim_percent" in fields else None,
+            clock_format=(
+                one(fields, "screen_saver_clock_format")
+                if "screen_saver_clock_format" in fields
+                else None
+            ),
+        )
+        self.redirect_home("settings", anchor="screen-saver")
 
     def handle_sleep_setting_post(self) -> None:
         fields = self.post_fields()
@@ -1459,15 +1137,44 @@ class SetupHandler(BaseHTTPRequestHandler):
             return
         if "enabled" in fields:
             save_sleep_timer_setting(enabled=one(fields, "enabled") == "1")
-            self.redirect_home()
+            self.redirect_home("settings", anchor="night-mode")
             return
         try:
             minutes = int(one(fields, "minutes"))
         except ValueError:
-            self.send_page(message="Sleep timer must be a whole number of minutes.", is_error=True)
+            self.send_page(message="Sleep timer must be a whole number of minutes.", is_error=True, active_tab="settings")
             return
         save_sleep_timer_setting(minutes=minutes)
-        self.redirect_home()
+        self.redirect_home("settings", anchor="night-mode")
+
+    def handle_listening_setting_post(self) -> None:
+        fields = self.post_fields()
+        if fields is None:
+            return
+        mode = one(fields, "night_mode")
+        consolidated = one(fields, "listening_page") == "1"
+        if consolidated and mode not in NIGHT_MODES:
+            self.send_request_error(400, "Choose Automatic, On or Off.")
+            return
+        update_config(lambda config: replace(
+            config,
+            night_mode=mode if consolidated else config.night_mode,
+            sleep_timer_enabled=one(fields, "sleep_timer_enabled") == "1" if consolidated else config.sleep_timer_enabled,
+            sleep_timer_minutes=(
+                valid_sleep_timer_minutes(one(fields, "sleep_timer_minutes")) if consolidated else config.sleep_timer_minutes
+            ),
+            skip_back_seconds=valid_skip_seconds(one(fields, "skip_back_seconds"), config.skip_back_seconds),
+            skip_forward_seconds=valid_skip_seconds(one(fields, "skip_forward_seconds"), config.skip_forward_seconds),
+            night_start=valid_clock_time(one(fields, "night_start")),
+            night_end=valid_clock_time(one(fields, "night_end")),
+            night_dim_percent=max(1, valid_feedback_volume(one(fields, "night_dim_percent"), config.night_dim_percent)),
+            night_volume_limit=max(1, valid_feedback_volume(one(fields, "night_volume_limit"), config.night_volume_limit)),
+            sleep_rewind=one(fields, "sleep_rewind") == "1",
+        ))
+        if consolidated:
+            self.redirect_settings("listening")
+        else:
+            self.redirect_home("settings", anchor="night-mode")
 
     def handle_podcasts_post(self) -> None:
         fields = self.post_fields()
@@ -1477,28 +1184,40 @@ class SetupHandler(BaseHTTPRequestHandler):
         try:
             save_podcast_settings(urls)
         except PodcastError as error:
-            self.send_page(message=f"Podcast save failed: {html.escape(str(error))}", is_error=True)
+            self.send_page(
+                message=f"Podcast save failed: {html.escape(str(error))}", is_error=True, active_tab="podcasts",
+            )
             return
-        self.redirect_home()
+        self.redirect_home("podcasts")
 
     def handle_system_reboot_post(self) -> None:
-        self.send_page(message="Rebooting the Chapter player. It will be available again shortly.")
+        self.send_page(
+            message="Rebooting the Chapter player. It will be available again shortly.", active_tab="system",
+        )
         schedule_system_reboot()
 
     def handle_system_update_post(self) -> None:
-        save_update_state(
-            SoftwareUpdateState(
-                phase="installing",
-                message="Preparing the software update.",
-                updated_at=time.time(),
-            )
-        )
+        if os.environ.get("CHAPTER_RELEASE_SOURCE") == "local":
+            self.send_request_error(409, "This release is installed locally. Use the local release installer.")
+            return
+        with update_request_lock:
+            if update_state_is_active(load_update_state()):
+                self.send_request_error(409, "A software update is already running.")
+                return
+            version = one(self.post_fields() or {}, "version").strip()
+            if not version_tuple(version) or version.startswith("v"):
+                self.send_request_error(400, "Review the available release before installing it.")
+                return
+            save_update_state(SoftwareUpdateState(
+                phase="installing", target_version=version,
+                message=f"Preparing to install v{version}.", updated_at=time.time(),
+            ))
         queue_web_player_command("pause")
         self.send_page(
             message=(
-                "Software update started. Playback is paused while Chapter installs the latest "
-                "release and restarts its services."
-            )
+                f"Software update requested for v{version}. Chapter will pause playback and restart its services."
+            ),
+            active_tab="system",
         )
         schedule_software_update()
 
@@ -1508,7 +1227,8 @@ class SetupHandler(BaseHTTPRequestHandler):
             message=(
                 f"Default settings restored. In about 5 seconds, connect to "
                 f"{html.escape(SETUP_HOTSPOT_SSID)}, then browse to {html.escape(SETUP_HOTSPOT_URL)}."
-            )
+            ),
+            active_tab="system",
         )
         schedule_system_reset()
 
@@ -1517,41 +1237,23 @@ class SetupHandler(BaseHTTPRequestHandler):
         message: str = "",
         is_error: bool = False,
         server_url: str | None = None,
-        library_id: str | None = None,
+        active_tab: str = "",
     ) -> None:
         config = load_config()
-        message_html = ""
-        if message:
-            css_class = "message error" if is_error else "message"
-            message_html = f'<div class="{css_class}">{message}</div>'
-
-        wifi = wifi_status()
-        csrf_token = self.csrf_token()
-        body = PAGE.format(
-            status_panel=render_status_panel(
-                wifi,
-                audiobookshelf_status(),
-                load_web_player_status(),
-                bluetooth_status(),
-                csrf_token,
-            ),
-            settings_card=render_settings_card(config, csrf_token),
-            podcasts_card=render_podcasts_card(config, csrf_token),
-            wifi_card=render_wifi_card(wifi, csrf_token),
-            system_card=render_system_card(csrf_token),
-            message=message_html,
-            server_url=html.escape(server_url if server_url is not None else config.server_url),
-            library_id=html.escape(library_id if library_id is not None else config.library_id),
-            csrf_token=html.escape(csrf_token, quote=True),
-            csrf_input=render_csrf_input(csrf_token),
-            csrf_field_name=CSRF_FIELD_NAME,
-        ).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        body = render_setup_page(
+            config=config,
+            wifi=web_wifi.current(wifi_status),
+            abs_status=connection_monitor.status_for(config),
+            player_status=load_web_player_status(),
+            bt_status=web_bluetooth.current(bluetooth_status),
+            csrf_token=self.csrf_token(),
+            message=message,
+            is_error=is_error,
+            server_url=server_url,
+            active_tab=active_tab,
+            download_activity=download_activity_status(config),
+        )
+        self.send_html(200, body)
 
     def send_csrf_error(self) -> None:
         self.send_request_error(
@@ -1559,126 +1261,58 @@ class SetupHandler(BaseHTTPRequestHandler):
             "This page has expired. Reload the Chapter setup page, then try again.",
         )
 
-    def send_request_error(self, status: int, message: str) -> None:
-        body = (
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-            "<title>Chapter Player</title></head><body><main>"
-            f"<h1>Chapter Player</h1><p>{html.escape(message)}</p>"
-            '<p><a href="/">Reload setup page</a></p></main></body></html>'
-        ).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def redirect_home(self) -> None:
+    def redirect_settings(self, section: str) -> None:
         self.send_response(303)
-        self.send_header("Location", "/")
+        self.send_header("Location", f"/settings/{section}?saved=1")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def send_player_command_response(self) -> None:
+    def redirect_home(self, tab: str = "", *, anchor: str = "") -> None:
+        location = "/?" + urlencode({"tab": tab}) if tab else "/"
+        if anchor:
+            location += "#" + quote(anchor, safe="")
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def send_player_command_response(self, command_id: str) -> None:
         if self.headers.get("X-Requested-With") == "fetch":
-            self.send_response(204)
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self.send_json({"id": command_id, "outcome": "queued"}, status=202)
             return
         self.redirect_home()
-
-    def send_text(self, text: str) -> None:
-        body = text.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def send_json(self, data: dict) -> None:
-        body = json.dumps(data).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
     def send_player_status_json(self) -> None:
         self.send_json(player_status_payload(load_web_player_status()))
 
     def send_system_update_status_json(self) -> None:
+        if os.environ.get("CHAPTER_RELEASE_SOURCE") == "local":
+            self.send_json({"phase": "local", "updateAvailable": False, "message": "Installed from a local package."})
+            return
         self.send_json(update_status_payload())
 
     def send_player_events(self) -> None:
+        self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
-        last_payload = ""
-        last_signature = ""
-        last_sent = 0.0
-        last_heartbeat = time.monotonic()
-        try:
-            self.wfile.write(b"retry: 2000\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
-            return
-        while True:
-            payload = player_status_payload(load_web_player_status())
-            payload_json = json.dumps(payload, separators=(",", ":"))
-            signature = player_status_event_signature(payload)
-            now = time.monotonic()
-            should_send = not last_payload
-            should_send = should_send or signature != last_signature
-            should_send = should_send or (payload_json != last_payload and now - last_sent >= PLAYER_EVENT_TIME_SECONDS)
-            if should_send:
-                try:
-                    self.wfile.write(player_status_sse(payload_json))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, TimeoutError):
-                    return
-                last_payload = payload_json
-                last_signature = signature
-                last_sent = now
-                last_heartbeat = now
-            elif now - last_heartbeat >= PLAYER_EVENT_HEARTBEAT_SECONDS:
-                try:
-                    self.wfile.write(b": heartbeat\n\n")
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, TimeoutError):
-                    return
-                last_heartbeat = now
-            time.sleep(PLAYER_EVENT_POLL_SECONDS)
+        stream_player_events(self.wfile, load_web_player_status, self.owner_authorized)
 
     def send_health_page(self) -> None:
-        wifi = wifi_status()
-        abs_status = audiobookshelf_status()
-        body = render_health_page(wifi, abs_status).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        wifi = web_wifi.current(wifi_status)
+        abs_status = connection_monitor.status_for(load_config())
+        self.send_html(200, render_health_page(wifi, abs_status))
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")
 
 
-def one(fields: dict[str, list[str]], name: str) -> str:
-    return fields.get(name, [""])[0].strip()
-
-
-def render_csrf_input(csrf_token: str) -> str:
-    return (
-        f'<input type="hidden" name="{CSRF_FIELD_NAME}" '
-        f'value="{html.escape(csrf_token, quote=True)}">'
-    )
+def library_read_key(config: AppConfig, view: str) -> tuple[str, str]:
+    return view, catalogue_request_key(config)
 
 
 def schedule_wifi_connect(ssid: str, password: str) -> None:
@@ -1762,6 +1396,7 @@ def schedule_software_update(
 def restore_device_defaults() -> AppConfig:
     config = AppConfig()
     save_config(config)
+    downloads.configuration_changed(config)
     clear_cached_books()
     clear_last_playback()
     queue_web_player_command("refresh_library")
@@ -1785,93 +1420,41 @@ def schedule_system_reset(delay_seconds: float = WIFI_CHANGE_DELAY_SECONDS) -> N
 def login_and_refresh_player(server_url: str, username: str, password: str) -> AppConfig:
     existing_config = load_config()
     client, login_data = AudiobookshelfClient.login(server_url, username, password)
-    resolved_library_id = str(login_data.get("userDefaultLibraryId") or "")
-    if not resolved_library_id:
-        resolved_library_id = client.choose_library_id()
-    config = replace(
-        existing_config,
-        server_url=server_url.strip(),
-        token=client.token,
-        refresh_token=getattr(client, "refresh_token", ""),
-        library_id=resolved_library_id,
-        username=login_username(login_data, username),
-    )
-    save_config(config)
+    default_library = str(login_data.get("userDefaultLibraryId") or "")
+    if not default_library and not (same_login(existing_config, server_url, username) and existing_config.library_id):
+        default_library = client.choose_library_id()
+
+    resolved_library = existing_config.library_id if same_login(existing_config, server_url, username) else ""
+
+    def apply_login(current: AppConfig) -> AppConfig:
+        same_account = same_login(current, server_url, username)
+        return replace(
+            current,
+            server_url=server_url.strip(),
+            token=client.token,
+            refresh_token=getattr(client, "refresh_token", ""),
+            library_id=(current.library_id if same_account else "") or default_library or resolved_library,
+            library_name=current.library_name if same_account else "",
+            username=login_username(login_data, username),
+            pinned_shelf=current.pinned_shelf if same_account else "",
+        )
+
+    _, config = update_config(apply_login)
+    downloads.configuration_changed(config)
     queue_web_player_command("pause")
     queue_web_player_command("refresh_library")
     return config
 
 
-def save_click_setting(enabled: bool) -> AppConfig:
-    config = load_config()
-    updated = replace(
-        config,
-        control_click_enabled=enabled,
-    )
-    save_config(updated)
-    return updated
-
-
-def save_spoken_navigation_setting(enabled: bool) -> AppConfig:
-    config = load_config()
-    updated = replace(config, spoken_navigation_enabled=enabled)
-    save_config(updated)
-    return updated
-
-
 def save_library_sort_setting(mode: str) -> AppConfig:
-    config = load_config()
-    updated = replace(config, library_sort_mode=valid_library_sort_mode(mode))
-    save_config(updated)
+    _, updated = update_config(lambda config: replace(config, library_sort_mode=valid_library_sort_mode(mode)))
     queue_web_player_command("resort_library")
-    return updated
-
-
-def save_playback_speed_setting(speed: object) -> AppConfig:
-    config = load_config()
-    updated = replace(config, playback_speed=valid_playback_speed(speed))
-    save_config(updated)
-    return updated
-
-
-def save_screen_saver_setting(mode: str, dim_percent: int | None = None) -> AppConfig:
-    config = load_config()
-    updated = replace(
-        config,
-        screen_saver_mode=valid_screen_saver_mode(mode),
-        screen_saver_dim_percent=(
-            config.screen_saver_dim_percent
-            if dim_percent is None
-            else valid_screen_saver_dim_percent(dim_percent)
-        ),
-    )
-    save_config(updated)
-    return updated
-
-
-def save_sleep_timer_setting(
-    enabled: bool | None = None,
-    minutes: int | None = None,
-) -> AppConfig:
-    config = load_config()
-    updated = replace(
-        config,
-        sleep_timer_enabled=config.sleep_timer_enabled if enabled is None else enabled,
-        sleep_timer_minutes=(
-            config.sleep_timer_minutes
-            if minutes is None
-            else valid_sleep_timer_minutes(minutes)
-        ),
-    )
-    save_config(updated)
     return updated
 
 
 def save_podcast_settings(urls: list[str]) -> AppConfig:
     podcasts = [resolve_podcast_config(url) for url in normalized_podcast_urls(urls)]
-    config = load_config()
-    updated = replace(config, podcasts=podcasts)
-    save_config(updated)
+    _, updated = update_config(lambda config: replace(config, podcasts=podcasts))
     queue_web_player_command("refresh_library")
     return updated
 
@@ -1891,561 +1474,11 @@ def normalized_podcast_urls(urls: list[str]) -> list[str]:
     return normalized
 
 
-def audiobookshelf_status() -> tuple[bool, str]:
-    config = load_config()
-    if not config.is_ready:
-        return False, "Not configured"
-
-    try:
-        client = client_from_config(config, AudiobookshelfClient)
-        client.choose_library_id(config.library_id)
-        username = saved_username(config.username)
-        if not username:
-            username = login_username(client.get_current_user(), "")
-            if username:
-                save_config(replace(config, username=username))
-    except AudiobookshelfError as error:
-        return False, str(error)
-
-    if username:
-        return True, f"Logged in to {config.server_url} as {username}"
-    return True, f"Logged in to {config.server_url}"
-
-
 def bluetooth_status() -> tuple[bool, str]:
     device = connected_bluetooth_audio_device()
     if device is None:
         return False, "Not connected"
     return True, f"Connected to {device.name}"
-
-
-def render_health_page(wifi: WifiStatus, abs_status: tuple[bool, str]) -> str:
-    abs_ok, abs_message = abs_status
-    return HEALTH_PAGE.format(
-        wifi_class="ok" if wifi.connected else "bad",
-        wifi_value=render_wifi_status_value(wifi),
-        abs_class="ok" if abs_ok else "bad",
-        abs_value=render_audiobookshelf_status_value(abs_message),
-        version=html.escape(__version__),
-    )
-
-
-def render_status_panel(
-    wifi: WifiStatus,
-    abs_status: tuple[bool, str],
-    player_status: WebPlayerStatus | None = None,
-    bt_status: tuple[bool, str] = (False, "Not connected"),
-    csrf_token: str = "",
-) -> str:
-    abs_ok, abs_message = abs_status
-    bt_ok, bt_message = bt_status
-    player_status = player_status or WebPlayerStatus()
-    return """
-    <section class="card" aria-labelledby="status-heading">
-      <h2 id="status-heading">Status</h2>
-      <div class="status" aria-label="Player status">
-        <div class="status-row">
-          <div class="status-label">Wi-Fi</div>
-          <div class="status-value {wifi_class}">{wifi_value}</div>
-        </div>
-        <div class="status-row">
-          <div class="status-label">Audiobookshelf</div>
-          <div class="status-value {abs_class}">{abs_value}</div>
-        </div>
-        <div class="status-row">
-          <div class="status-label">Bluetooth</div>
-          <div class="status-value {bt_class}">{bt_value}</div>
-        </div>
-        <div class="status-row">
-          <div class="status-label">Currently Playing</div>
-          {player_value}
-        </div>
-      </div>
-    </section>
-    """.format(
-        wifi_class="ok" if wifi.connected else "bad",
-        wifi_value=render_wifi_status_value(wifi),
-        abs_class="ok" if abs_ok else "bad",
-        abs_value=render_audiobookshelf_status_value(abs_message),
-        bt_class="ok" if bt_ok else "bad",
-        bt_value=render_bluetooth_status_value(bt_message),
-        player_value=render_player_status_value(player_status, csrf_token),
-    )
-
-
-def render_system_card(csrf_token: str = "") -> str:
-    return """
-    <section class="card" aria-labelledby="system-heading">
-      <h2 id="system-heading">System</h2>
-      <div class="system-version">
-        <div>
-          <span class="system-version-label">Software Version</span>
-          <strong class="system-version-number">v{version}</strong>
-          <span class="system-update-status" data-system-update-status aria-live="polite">Checking for updates...</span>
-          <p class="system-update-description" data-system-update-description></p>
-        </div>
-        <button type="button" aria-expanded="false" aria-controls="confirm-update" data-confirm-trigger="update" data-system-update-trigger hidden>Update</button>
-        <div class="confirmation-panel update-confirmation" id="confirm-update" data-confirm-panel="update" hidden>
-          <strong>Install <span data-system-update-version>the latest release</span>?</strong>
-          <p>Playback will pause and the player controls may be unavailable for a few minutes. Your Wi-Fi, Audiobookshelf login, podcasts, and settings will be kept.</p>
-          <div class="confirmation-actions">
-            <button class="secondary" type="button" data-confirm-cancel>Cancel</button>
-            <form method="post" action="/system/update">
-              {csrf_input}
-              <button type="submit">Install Update</button>
-            </form>
-          </div>
-        </div>
-      </div>
-      <div class="system-actions">
-        <div class="system-action">
-          <div>
-            <h3>Reboot</h3>
-            <p>Restart the Chapter player without changing its settings.</p>
-          </div>
-          <button class="secondary" type="button" aria-expanded="false" aria-controls="confirm-reboot" data-confirm-trigger="reboot">Reboot</button>
-          <div class="confirmation-panel" id="confirm-reboot" data-confirm-panel="reboot" hidden>
-            <strong>Are you sure you want to reboot?</strong>
-            <p>Playback will stop while the device restarts.</p>
-            <div class="confirmation-actions">
-              <button class="secondary" type="button" data-confirm-cancel>Cancel</button>
-              <form method="post" action="/system/reboot">
-                {csrf_input}
-                <button type="submit">Reboot</button>
-              </form>
-            </div>
-          </div>
-        </div>
-        <div class="system-action">
-          <div>
-            <h3>Restore Device to Default Settings</h3>
-            <p>Clear this player and return it to Wi-Fi setup mode.</p>
-          </div>
-          <button class="danger-button" type="button" aria-expanded="false" aria-controls="confirm-restore" data-confirm-trigger="restore">Restore</button>
-          <div class="confirmation-panel" id="confirm-restore" data-confirm-panel="restore" hidden>
-            <strong>Are you sure you want to restore the device to default settings?</strong>
-            <p>This clears the Audiobookshelf login, listening state, saved podcasts, and all saved Wi-Fi networks, and restores player settings to defaults. This cannot be undone.</p>
-            <div class="confirmation-actions">
-              <button class="secondary" type="button" data-confirm-cancel>Cancel</button>
-              <form method="post" action="/system/reset">
-                {csrf_input}
-                <button class="danger-button" type="submit">Restore Device</button>
-              </form>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-    """.format(version=html.escape(__version__), csrf_input=render_csrf_input(csrf_token))
-
-
-def render_settings_card(config: AppConfig, csrf_token: str = "") -> str:
-    csrf_input = render_csrf_input(csrf_token)
-    enabled = config.control_click_enabled
-    next_value = "0" if enabled else "1"
-    toggle_class = " is-on" if enabled else ""
-    aria_pressed = "true" if enabled else "false"
-    button_label = "Disable control knob click sound" if enabled else "Enable control knob click sound"
-    spoken_navigation_enabled = config.spoken_navigation_enabled
-    spoken_navigation_next_value = "0" if spoken_navigation_enabled else "1"
-    spoken_navigation_toggle_class = " is-on" if spoken_navigation_enabled else ""
-    spoken_navigation_aria_pressed = "true" if spoken_navigation_enabled else "false"
-    spoken_navigation_button_label = (
-        "Disable spoken navigation" if spoken_navigation_enabled else "Enable spoken navigation"
-    )
-    sleep_enabled = config.sleep_timer_enabled
-    sleep_next_value = "0" if sleep_enabled else "1"
-    sleep_toggle_class = " is-on" if sleep_enabled else ""
-    sleep_aria_pressed = "true" if sleep_enabled else "false"
-    sleep_button_label = "Disable sleep timer" if sleep_enabled else "Enable sleep timer"
-    sleep_duration_controls = ""
-    if sleep_enabled:
-        sleep_duration_controls = """
-          <form class="sleep-timer-duration-form" method="post" action="/settings/sleep">
-            {csrf_input}
-            <span>Ask after</span>
-            <input class="settings-number" name="minutes" type="number" min="{sleep_min}" max="{sleep_max}" step="1" value="{sleep_minutes}" aria-label="Sleep timer minutes">
-            <span>minutes of listening</span>
-            <button class="small-button secondary" type="submit">Save</button>
-          </form>
-        """.format(
-            sleep_minutes=config.sleep_timer_minutes,
-            sleep_min=MIN_SLEEP_TIMER_MINUTES,
-            sleep_max=MAX_SLEEP_TIMER_MINUTES,
-            csrf_input=csrf_input,
-        )
-    return """
-    <section class="card" aria-labelledby="settings-heading">
-      <h2 id="settings-heading">Settings</h2>
-      <div class="settings-list">
-        <div class="settings-row">
-          <div>
-            <div class="setting-name">Control knob click sound</div>
-          </div>
-          <form class="toggle-form" method="post" action="/settings/click">
-            {csrf_input}
-            <input type="hidden" name="enabled" value="{next_value}">
-            <button class="toggle-button{toggle_class}" type="submit" aria-pressed="{aria_pressed}">
-              <span class="sr-only">{button_label}</span>
-            </button>
-          </form>
-        </div>
-        <div class="settings-row">
-          <div>
-            <div class="setting-name">Spoken navigation</div>
-          </div>
-          <form class="toggle-form" method="post" action="/settings/spoken-navigation">
-            {csrf_input}
-            <input type="hidden" name="enabled" value="{spoken_navigation_next_value}">
-            <button class="toggle-button{spoken_navigation_toggle_class}" type="submit" aria-pressed="{spoken_navigation_aria_pressed}">
-              <span class="sr-only">{spoken_navigation_button_label}</span>
-            </button>
-          </form>
-        </div>
-        <div class="settings-row">
-          <div>
-            <div class="setting-name">Library order</div>
-          </div>
-          <form class="select-form" method="post" action="/settings/library-order">
-            {csrf_input}
-            <select class="settings-select" name="library_sort_mode" aria-label="Library order">
-              {library_sort_options}
-            </select>
-            <button class="small-button secondary" type="submit">Save</button>
-          </form>
-        </div>
-        <div class="settings-row">
-          <div>
-            <div class="setting-name">Playback speed</div>
-          </div>
-          <form class="select-form" method="post" action="/settings/playback-speed">
-            {csrf_input}
-            <select class="settings-select" name="playback_speed" aria-label="Playback speed">
-              {playback_speed_options}
-            </select>
-            <button class="small-button secondary" type="submit">Save</button>
-          </form>
-        </div>
-        <div class="settings-row screen-saver-row">
-          <div>
-            <div class="setting-name">Screen saver</div>
-          </div>
-          <form class="screen-saver-settings-form" method="post" action="/settings/screensaver">
-            {csrf_input}
-            <label>
-              Style
-              <select class="settings-select" name="screen_saver_mode" aria-label="Screen saver style">
-                {screen_saver_options}
-              </select>
-            </label>
-            <label>
-              Dim level
-              <select class="settings-select" name="screen_saver_dim_percent" aria-label="Screen saver dim level">
-                {screen_saver_dim_options}
-              </select>
-            </label>
-            <button class="small-button secondary" type="submit">Save</button>
-          </form>
-        </div>
-        <div class="settings-row">
-          <div class="sleep-timer-content">
-            <div class="setting-name">Sleep timer</div>
-            {sleep_duration_controls}
-          </div>
-          <form class="toggle-form" method="post" action="/settings/sleep">
-            {csrf_input}
-            <input type="hidden" name="enabled" value="{sleep_next_value}">
-            <button class="toggle-button{sleep_toggle_class}" type="submit" aria-pressed="{sleep_aria_pressed}">
-              <span class="sr-only">{sleep_button_label}</span>
-            </button>
-          </form>
-        </div>
-      </div>
-    </section>
-    """.format(
-        next_value=next_value,
-        toggle_class=toggle_class,
-        aria_pressed=aria_pressed,
-        button_label=button_label,
-        spoken_navigation_next_value=spoken_navigation_next_value,
-        spoken_navigation_toggle_class=spoken_navigation_toggle_class,
-        spoken_navigation_aria_pressed=spoken_navigation_aria_pressed,
-        spoken_navigation_button_label=spoken_navigation_button_label,
-        library_sort_options=render_library_sort_options(config.library_sort_mode),
-        playback_speed_options=render_playback_speed_options(config.playback_speed),
-        screen_saver_options=render_screen_saver_options(config.screen_saver_mode),
-        screen_saver_dim_options=render_screen_saver_dim_options(config.screen_saver_dim_percent),
-        sleep_next_value=sleep_next_value,
-        sleep_toggle_class=sleep_toggle_class,
-        sleep_aria_pressed=sleep_aria_pressed,
-        sleep_button_label=sleep_button_label,
-        sleep_duration_controls=sleep_duration_controls,
-        csrf_input=csrf_input,
-    )
-
-
-def render_podcasts_card(config: AppConfig, csrf_token: str = "") -> str:
-    rows = [render_podcast_row(index, podcast) for index, podcast in enumerate(config.podcasts)]
-    rows.append(render_podcast_row(len(rows), None))
-    return """
-    <section class="card" aria-labelledby="podcasts-heading">
-      <h2 id="podcasts-heading">Podcasts</h2>
-      <p class="hint">Paste the show link from podcasts.apple.com. RSS feed URLs also work. The player will show each podcast as a title and play the latest episode.</p>
-      <form class="podcast-form" method="post" action="/podcasts">
-        {csrf_input}
-        <div class="podcast-table" data-podcast-rows>
-          {rows}
-        </div>
-        <div class="podcast-actions">
-          <button class="small-button secondary" type="button" data-add-podcast-row>Add row</button>
-          <button class="podcast-save-button" type="submit">Save Podcasts</button>
-        </div>
-      </form>
-    </section>
-    """.format(rows="\n".join(rows), csrf_input=render_csrf_input(csrf_token))
-
-
-def render_podcast_row(index: int, podcast: PodcastConfig | None) -> str:
-    podcast = podcast or PodcastConfig(url="")
-    metadata = podcast_metadata_label(podcast)
-    return """
-    <div class="podcast-row">
-      <div>
-        <label class="sr-only" for="podcast_url_{index}">Podcast URL</label>
-        <input id="podcast_url_{index}" name="podcast_url" type="url" value="{url}" placeholder="https://podcasts.apple.com/...">
-        <div class="podcast-meta">{metadata}</div>
-      </div>
-      <button class="small-button secondary" type="button" data-remove-podcast-row>Remove</button>
-    </div>
-    """.format(
-        index=index,
-        url=html.escape(podcast.url),
-        metadata=html.escape(metadata),
-    )
-
-
-def podcast_metadata_label(podcast: PodcastConfig) -> str:
-    if podcast.title and podcast.author:
-        return f"{podcast.title} by {podcast.author}"
-    if podcast.title:
-        return podcast.title
-    return "Paste a show link from podcasts.apple.com"
-
-
-def render_screen_saver_options(selected_mode: str) -> str:
-    options = (
-        (SCREEN_SAVER_CHAPTER, "Chapter word"),
-        (SCREEN_SAVER_BOOKS, "Book titles"),
-        (SCREEN_SAVER_CLOCK, "Digital clock"),
-    )
-    return "\n".join(
-        '<option value="{value}"{selected}>{label}</option>'.format(
-            value=html.escape(value),
-            selected=" selected" if value == selected_mode else "",
-            label=html.escape(label),
-        )
-        for value, label in options
-    )
-
-
-def render_library_sort_options(selected_mode: str) -> str:
-    options = (
-        (LIBRARY_SORT_TITLE, "Title"),
-        (LIBRARY_SORT_AUTHOR, "Author (last name)"),
-    )
-    return "\n".join(
-        '<option value="{value}"{selected}>{label}</option>'.format(
-            value=value,
-            selected=" selected" if value == selected_mode else "",
-            label=label,
-        )
-        for value, label in options
-    )
-
-
-def render_playback_speed_options(selected_speed: float) -> str:
-    return "\n".join(
-        '<option value="{value}"{selected}>{label}</option>'.format(
-            value=f"{speed:g}",
-            selected=" selected" if speed == selected_speed else "",
-            label=f"{speed:g}x",
-        )
-        for speed in PLAYBACK_SPEEDS
-    )
-
-
-def render_screen_saver_dim_options(selected_percent: int) -> str:
-    labels = {
-        10: "10% (darkest)",
-        50: "50% (brightest)",
-    }
-    return "\n".join(
-        '<option value="{value}"{selected}>{label}</option>'.format(
-            value=value,
-            selected=" selected" if value == selected_percent else "",
-            label=labels.get(value, f"{value}%"),
-        )
-        for value in SCREEN_SAVER_DIM_LEVELS
-    )
-
-
-def render_player_status_value(status: WebPlayerStatus, csrf_token: str = "") -> str:
-    volume = min(max(status.volume_percent, 0), 100)
-    state = "Playing" if status.is_playing else "Paused"
-    if status.muted or volume <= 0:
-        state = "Muted"
-    button_action = "pause" if status.is_playing else "play"
-    button_text = "Pause" if status.is_playing else "Play"
-    title = html.escape(status.title) if status.has_session else "Nothing playing"
-    meta = f"{html.escape(state)} · {html.escape(render_time_info(status))}" if status.has_session else ""
-    hidden_class = "" if status.has_session else " hidden"
-    return """
-    <div class="status-value" data-now-playing data-has-session="{has_session}">
-      <div class="now-playing-title" data-now-playing-title>{title}</div>
-      <div class="now-playing-meta" data-now-playing-meta>{meta}</div>
-      <form class="playback-form{hidden_class}" data-playback-form method="post" action="/player">
-        {csrf_input}
-        <input data-playback-action type="hidden" name="action" value="{button_action}">
-        <button data-playback-button type="submit">{button_text}</button>
-      </form>
-      <form class="volume-form{hidden_class}" data-volume-form method="post" action="/player">
-        {csrf_input}
-        <input type="hidden" name="action" value="volume">
-        <div class="volume-icon" aria-hidden="true">&#128266;</div>
-        <input class="volume-slider" data-volume-slider aria-label="Volume" name="volume" type="range" min="0" max="100" value="{volume}">
-        <div class="volume-percent" data-volume-percent>{volume}%</div>
-      </form>
-    </div>
-    """.format(
-        has_session="1" if status.has_session else "0",
-        title=title,
-        meta=meta,
-        hidden_class=hidden_class,
-        volume=volume,
-        button_action=button_action,
-        button_text=button_text,
-        csrf_input=render_csrf_input(csrf_token),
-    )
-
-
-def render_time_info(status: WebPlayerStatus) -> str:
-    if status.duration <= 0:
-        return format_duration(status.current_time)
-    return f"{format_duration(status.current_time)} / {format_duration(status.duration)}"
-
-
-def player_status_payload(status: WebPlayerStatus) -> dict:
-    volume = min(max(status.volume_percent, 0), 100)
-    state = "Playing" if status.is_playing else "Paused"
-    if status.muted or volume <= 0:
-        state = "Muted"
-    return {
-        "hasSession": status.has_session,
-        "title": status.title,
-        "state": state,
-        "timeInfo": render_time_info(status),
-        "currentTime": max(0, status.current_time),
-        "duration": max(0, status.duration),
-        "updatedAt": status.updated_at,
-        "isPlaying": status.is_playing,
-        "volumePercent": volume,
-    }
-
-
-def player_status_event_signature(payload: dict) -> str:
-    important = {
-        "hasSession": payload.get("hasSession"),
-        "title": payload.get("title"),
-        "state": payload.get("state"),
-        "isPlaying": payload.get("isPlaying"),
-        "volumePercent": payload.get("volumePercent"),
-        "duration": payload.get("duration"),
-    }
-    return json.dumps(important, sort_keys=True, separators=(",", ":"))
-
-
-def player_status_sse(payload_json: str) -> bytes:
-    return f"data: {payload_json}\n\n".encode("utf-8")
-
-
-def format_duration(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
-
-
-def render_wifi_status_value(wifi: WifiStatus) -> str:
-    if wifi.connected and wifi.ssid:
-        return f"Connected to <strong>{html.escape(wifi.ssid)}</strong>"
-    return html.escape(wifi.message or "Unknown")
-
-
-def render_audiobookshelf_status_value(message: str) -> str:
-    prefix = "Logged in to "
-    if not message.startswith(prefix):
-        return html.escape(message)
-
-    login_target = message[len(prefix) :]
-    if " as " in login_target:
-        server_url, username = login_target.rsplit(" as ", 1)
-        return (
-            f"Logged in to <strong>{html.escape(server_url)}</strong> "
-            f"as <strong>{html.escape(username)}</strong>"
-        )
-    return f"Logged in to <strong>{html.escape(login_target)}</strong>"
-
-
-def render_bluetooth_status_value(message: str) -> str:
-    prefix = "Connected to "
-    if message.startswith(prefix):
-        device_name = message[len(prefix) :]
-        return f"Connected to <strong>{html.escape(device_name)}</strong>"
-    return html.escape(message)
-
-
-def render_wifi_card(wifi: WifiStatus, csrf_token: str = "") -> str:
-    if wifi.connected and wifi.ssid and wifi.ssid != SETUP_HOTSPOT_SSID:
-        return """
-        <section class="card" aria-labelledby="wifi-heading">
-          <h2 id="wifi-heading">Wi-Fi</h2>
-          <p class="hint">Connected to <strong>{ssid}</strong>.</p>
-          <p class="hint">Forgetting this network will make the device form its own open Wi-Fi network. Connect to <code>{hotspot_ssid}</code>, then browse to <code>{hotspot_url}</code>.</p>
-          <form method="post" action="/wifi/forget">
-            {csrf_input}
-            <button type="submit">Forget this WiFi network</button>
-          </form>
-        </section>
-        """.format(
-            ssid=html.escape(wifi.ssid),
-            hotspot_ssid=html.escape(SETUP_HOTSPOT_SSID),
-            hotspot_url=html.escape(SETUP_HOTSPOT_URL),
-            csrf_input=render_csrf_input(csrf_token),
-        )
-
-    return """
-    <section class="card" aria-labelledby="wifi-heading">
-      <h2 id="wifi-heading">Wi-Fi</h2>
-      <p class="hint">Connect to the open Wi-Fi network <code>{hotspot_ssid}</code>, then browse to <code>{hotspot_url}</code>.</p>
-      <form method="post" action="/wifi">
-        {csrf_input}
-        <label for="wifi_ssid">Wi-Fi network name</label>
-        <input id="wifi_ssid" name="wifi_ssid" autocomplete="off" required>
-
-        <label for="wifi_password">Wi-Fi password</label>
-        <input id="wifi_password" name="wifi_password" type="password" autocomplete="current-password">
-
-        <button type="submit">Connect to Wi-Fi</button>
-      </form>
-    </section>
-    """.format(
-        hotspot_ssid=html.escape(SETUP_HOTSPOT_SSID),
-        hotspot_url=html.escape(SETUP_HOTSPOT_URL),
-        csrf_input=render_csrf_input(csrf_token),
-    )
 
 
 def login_username(login_data: dict, fallback: str) -> str:
@@ -2465,18 +1498,26 @@ def login_username(login_data: dict, fallback: str) -> str:
     return ""
 
 
-def saved_username(username: str) -> str:
-    username = username.strip()
-    if username.lower() == "unknown user":
-        return ""
-    return username
+class SetupServer(ThreadingHTTPServer):
+    request_queue_size = 64
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(15)
+        return request, address
 
 
 def run_setup_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
-    server = ThreadingHTTPServer((host, port), SetupHandler)
+    server = SetupServer((host, port), SetupHandler)
     server.csrf_token = secrets.token_urlsafe(32)
+    log_installed_build("setup")
     print(f"Setup page listening on http://{host}:{port}")
-    server.serve_forever()
+    downloads.start_worker()
+    try:
+        server.serve_forever()
+    finally:
+        downloads.close()
+        server.server_close()
 
 
 def main() -> None:

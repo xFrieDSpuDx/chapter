@@ -6,9 +6,9 @@ Security fixes are made for the latest tagged release. Update to the release sho
 
 ## Trusted Network Design
 
-Chapter Player is a local appliance. Its administration page intentionally has no account or password and is designed only for a trusted private home network.
+Chapter Player is for a trusted private home network. Set an owner username and password in **Settings → Security** to require login. You can allow read-only visitor access to Overview, Library and Downloads from the same page. Settings and commands always require login once an owner account exists. See the [owner access and recovery instructions](docs/raspberry-pi-zero-2w-install.md#owner-access-and-password-recovery).
 
-Anyone who can reach the administration page can control playback, change player settings, replace the Audiobookshelf login, change or forget Wi-Fi, reboot the player, or restore it to default settings. The setup service also performs privileged system operations so it can manage networking and reboot the appliance.
+Before you set an owner password, anyone who can reach the administration page can control playback, change player settings, replace the Audiobookshelf login, change or forget Wi-Fi, reboot the player, or restore it to default settings. The setup service also performs privileged system operations so it can manage networking and reboot the appliance.
 
 - Do not expose ports `80` or `47831` to the internet.
 - Do not configure router port forwarding for the player.
@@ -21,3 +21,7 @@ The administration page uses CSRF tokens to stop unrelated websites from submitt
 ## Reporting A Vulnerability
 
 Please do not disclose a suspected vulnerability in a public issue. Use GitHub's private vulnerability reporting option on the repository's Security tab when available. Include the affected release, reproduction steps, expected behavior, and observed behavior.
+
+## Installed code ownership
+
+The local package keeps both executable releases under root-owned directories in `/opt/chapter-player`. The root setup and boot services use the system Python installation. The service account writes preferences, listening state and downloads in its home directory. The fork's published-release installer uses a root-owned Git checkout and checks its parent directories before installation. Local packages use their own rollback path.

@@ -3,6 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+@dataclass(frozen=True)
+class SeriesMembership:
+    id: str
+    name: str
+    sequence: str = ""
+
+
 @dataclass
 class Book:
     id: str
@@ -15,10 +22,32 @@ class Book:
     series_name: str = ""
     series_sequence: str = ""
     series_total: int = 0
+    series_memberships: tuple[SeriesMembership, ...] = ()
+    progress_updated_at: int = 0
+    is_finished: bool = False
+    pinned_position: int | None = None
+    episode_id: str = ""
+    podcast_title: str = ""
+    source_item_id: str = ""
+    narrator: str = ""
+    downloaded: bool = False
+    download_only: bool = False
 
     @property
     def has_play_history(self) -> bool:
-        return self.current_time >= 5 and self.progress < 0.995
+        return self.current_time > 0 and not self.finished
+
+    @property
+    def finished(self) -> bool:
+        return self.is_finished or self.progress >= 0.995
+
+    @property
+    def series(self) -> tuple[SeriesMembership, ...]:
+        if self.series_memberships:
+            return self.series_memberships
+        if self.series_name:
+            return (SeriesMembership("", self.series_name, self.series_sequence),)
+        return ()
 
     @property
     def display_title(self) -> str:
@@ -45,6 +74,8 @@ class AudioTrack:
     duration: float
     url: str
     title: str
+    file_id: int | None = None
+    size_bytes: int | None = None
 
 
 @dataclass
@@ -66,3 +97,11 @@ class PlaybackSession:
     cover_url: str
     tracks: list[AudioTrack]
     chapters: list[Chapter]
+    play_method: int | None = None
+    episode_id: str = ""
+    progress_account: str = ""
+    downloaded: bool = False
+    download_directory: str = ""
+    progress_updated_at: int = 0
+    library_id: str = ""
+    server_checkpoint: tuple[float, int] | None = None

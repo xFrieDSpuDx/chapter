@@ -9,11 +9,11 @@ import threading
 import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from . import __version__
-from .models import AudioTrack, Book, Chapter, PlaybackSession
+from .models import AudioTrack, Book, Chapter, PlaybackSession, SeriesMembership
 
 
 SUPPORTED_MIME_TYPES = [
@@ -51,6 +51,7 @@ class AudiobookshelfClient:
         self.refresh_token = refresh_token
         self.token_loader = token_loader
         self.token_saver = token_saver
+        self.progress_account = ""
 
     def _url(self, path: str, query: dict[str, Any] | None = None) -> str:
         url = urljoin(self.server_url, path.lstrip("/"))
@@ -98,8 +99,30 @@ class AudiobookshelfClient:
         path: str,
         body: dict[str, Any] | list[Any] | None = None,
         query: dict[str, Any] | None = None,
+        *, timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> Any:
-        return self._request(method, path, body=body, query=query, allow_refresh=True)
+        return self._request(method, path, body=body, query=query, allow_refresh=True, timeout=timeout)
+
+    def open_download(
+        self, path: str, offset: int = 0, *, validator: str = "", timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ):
+        def open_with_token():
+            headers = {"Accept-Encoding": "identity"}
+            if offset:
+                headers["Range"] = f"bytes={offset}-"
+                headers["If-Range"] = validator
+            request = Request(self._url(path), headers=headers)
+            request.add_unredirected_header("Authorization", f"Bearer {self.token}")
+            return urlopen(request, timeout=timeout)
+
+        failed_token = self.token
+        try:
+            return open_with_token()
+        except HTTPError as error:
+            if error.code != 401 or not self.refresh_access_token(failed_token):
+                raise
+            error.close()
+            return open_with_token()
 
     def _request(
         self,
@@ -108,6 +131,7 @@ class AudiobookshelfClient:
         body: dict[str, Any] | list[Any] | None,
         query: dict[str, Any] | None,
         allow_refresh: bool,
+        timeout: float,
     ) -> Any:
         data = None
         failed_token = self.token
@@ -118,12 +142,12 @@ class AudiobookshelfClient:
 
         request = Request(self._url(path, query), data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS) as response:
+            with urlopen(request, timeout=timeout) as response:
                 payload = response.read()
         except HTTPError as error:
             details = error.read().decode("utf-8", errors="replace")
-            if error.code == 401 and allow_refresh and self.refresh_access_token(failed_token):
-                return self._request(method, path, body=body, query=query, allow_refresh=False)
+            if error.code == 401 and allow_refresh and self.refresh_access_token(failed_token, timeout=timeout):
+                return self._request(method, path, body=body, query=query, allow_refresh=False, timeout=timeout)
             raise AudiobookshelfError(f"Audiobookshelf returned {error.code}: {details}") from error
         except TimeoutError as error:
             raise AudiobookshelfError("Audiobookshelf request timed out.") from error
@@ -138,7 +162,7 @@ class AudiobookshelfClient:
         except json.JSONDecodeError:
             return payload
 
-    def refresh_access_token(self, failed_token: str | None = None) -> bool:
+    def refresh_access_token(self, failed_token: str | None = None, *, timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS) -> bool:
         with _AUTH_REFRESH_LOCK:
             if self.token_loader is not None:
                 stored_token, stored_refresh_token = self.token_loader()
@@ -159,7 +183,7 @@ class AudiobookshelfClient:
                 method="POST",
             )
             try:
-                with urlopen(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS) as response:
+                with urlopen(request, timeout=timeout) as response:
                     data = json.loads(response.read().decode("utf-8"))
             except HTTPError as error:
                 error.read()
@@ -191,9 +215,11 @@ class AudiobookshelfClient:
 
     def get_libraries(self) -> list[dict[str, Any]]:
         data = self.request("GET", "/api/libraries")
-        if isinstance(data, list):
-            return list(data)
-        return list(data.get("libraries", []))
+        if isinstance(data, dict):
+            data = data.get("libraries")
+        if not isinstance(data, list) or not all(isinstance(library, dict) for library in data):
+            raise AudiobookshelfError("Audiobookshelf did not return a library list.")
+        return data
 
     def choose_library_id(self, configured_id: str = "") -> str:
         if configured_id:
@@ -220,21 +246,26 @@ class AudiobookshelfClient:
             f"/api/libraries/{library_id}/items",
             query={"sort": "media.metadata.title", "minified": 0},
         )
+        items = data.get("results", [])
+        account_progress = (
+            self._account_book_progress() if any(not extract_progress(item) for item in items) else None
+        )
         books: list[Book] = []
         series_keys: list[str] = []
         fallback_counts: dict[str, int] = {}
         fallback_highest_sequences: dict[str, int] = {}
-        for item in data.get("results", []):
+        for item in items:
+            item_id = str(item["id"])
             media = item.get("media") or {}
             metadata = media.get("metadata") or {}
             title = metadata.get("title") or item.get("relPath") or "Untitled"
             author = author_from_metadata(metadata)
             cover_url = self.authenticated_media_url(f"/api/items/{item['id']}/cover")
-            progress = extract_progress(item)
+            progress = self._library_item_progress(item, item_id, account_progress)
             series_name, series_sequence = primary_series_from_metadata(metadata)
             series_key = series_name.casefold()
             book = Book(
-                id=str(item["id"]),
+                id=item_id,
                 title=str(title),
                 author=str(author),
                 duration=float(media.get("duration") or 0),
@@ -243,11 +274,11 @@ class AudiobookshelfClient:
                 progress=float(progress.get("progress") or 0),
                 series_name=series_name,
                 series_sequence=series_sequence,
+                series_memberships=series_memberships_from_metadata(metadata),
+                is_finished=bool(progress.get("isFinished")),
+                progress_updated_at=_optional_unsigned_integer(progress.get("lastUpdate")) or 0,
+                narrator=narrator_from_metadata(metadata),
             )
-            if not book.current_time:
-                remote_progress = self.get_progress(book.id) or {}
-                book.current_time = float(remote_progress.get("currentTime") or 0)
-                book.progress = float(remote_progress.get("progress") or 0)
             books.append(book)
             series_keys.append(series_key)
             if series_key:
@@ -270,6 +301,36 @@ class AudiobookshelfClient:
                 ),
             )
         return books
+
+    def _account_book_progress(self) -> dict[str, dict[str, Any]] | None:
+        try:
+            user = self.get_current_user()
+        except AudiobookshelfError as error:
+            cause = error.__cause__
+            if isinstance(cause, HTTPError) and cause.code in (404, 405, 501):
+                return None
+            raise
+
+        if isinstance(user.get("user"), dict):
+            user = user["user"]
+        rows = user.get("mediaProgress")
+        if not isinstance(rows, list):
+            return None
+        return {
+            str(row["libraryItemId"]): row
+            for row in rows
+            if isinstance(row, dict) and row.get("libraryItemId") and not row.get("episodeId")
+        }
+
+    def _library_item_progress(
+        self,
+        item: dict[str, Any],
+        item_id: str,
+        account_progress: dict[str, dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        if account_progress is not None:
+            return account_progress.get(item_id) or extract_progress(item)
+        return extract_progress(item) or self.get_progress(item_id) or {}
 
     def get_series_totals(self, library_id: str) -> dict[str, int]:
         try:
@@ -295,19 +356,37 @@ class AudiobookshelfClient:
                 totals[name.casefold()] = total
         return totals
 
-    def get_progress(self, item_id: str) -> dict[str, Any] | None:
+    def get_progress(self, item_id: str, *, episode_id: str = "", timeout: float | None = None) -> dict[str, Any] | None:
+        path = f"/api/me/progress/{progress_item_path(item_id, episode_id)}"
         try:
-            return self.request("GET", f"/api/me/progress/{item_id}")
+            if timeout is None:
+                return self.request("GET", path)
+            return self.request("GET", path, timeout=timeout)
         except AudiobookshelfError as error:
             if "404" in str(error):
                 return None
             raise
 
-    def start_playback(self, item_id: str, start_over: bool = False, resume_time: float = 0) -> PlaybackSession:
-        saved_progress = {} if start_over else self.get_progress(item_id) or {}
+    def create_bookmark(self, item_id: str, current_time: float, title: str) -> None:
+        self.request(
+            "POST", f"/api/me/item/{quote(item_id, safe='')}/bookmark",
+            body={"time": max(0, int(current_time)), "title": title},
+        )
+
+    def start_playback(
+        self, item_id: str, start_over: bool = False, resume_time: float = 0, *,
+        episode_id: str = "", pending_position: tuple[float, int] | None = None,
+    ) -> PlaybackSession:
+        if start_over:
+            saved_progress = {}
+        elif episode_id:
+            saved_progress = self.get_progress(item_id, episode_id=episode_id) or {}
+        else:
+            saved_progress = self.get_progress(item_id) or {}
+        episode_path = f"/{quote(episode_id, safe='')}" if episode_id else ""
         session = self.request(
             "POST",
-            f"/api/items/{item_id}/play",
+            f"/api/items/{quote(item_id, safe='')}/play{episode_path}",
             body={
                 "deviceInfo": {
                     "clientName": "ABS Kids Player",
@@ -320,15 +399,15 @@ class AudiobookshelfClient:
             },
         )
         current_time = 0 if start_over else progress_current_time(saved_progress, {"currentTime": resume_time}, session)
+        if not start_over and saved_progress.get("lastUpdate") and saved_progress.get("currentTime") is not None:
+            current_time = float(saved_progress["currentTime"])
+        if saved_progress.get("isFinished") is True:
+            current_time = 0
+        if pending_position and not start_over and pending_position[1] >= (saved_progress.get("lastUpdate") or 0):
+            current_time = pending_position[0]
         cover_path = session.get("coverPath") or f"/api/items/{item_id}/cover"
         tracks = [
-            AudioTrack(
-                index=int(track.get("index") or index + 1),
-                start_offset=float(track.get("startOffset") or 0),
-                duration=float(track.get("duration") or 0),
-                url=self.authenticated_media_url(str(track["contentUrl"])),
-                title=str(track.get("title") or ""),
-            )
+            self._parse_audio_track(track, index)
             for index, track in enumerate(session.get("audioTracks") or [])
             if track.get("contentUrl")
         ]
@@ -360,6 +439,34 @@ class AudiobookshelfClient:
             cover_url=self.authenticated_media_url(str(cover_path)),
             tracks=tracks,
             chapters=chapters,
+            play_method=_optional_unsigned_integer(session.get("playMethod")),
+            episode_id=episode_id,
+            progress_account=self.progress_account,
+            server_checkpoint=server_position(saved_progress),
+            progress_updated_at=max(_optional_unsigned_integer(saved_progress.get("lastUpdate")) or 0,
+                                    pending_position[1] if pending_position and not start_over else 0),
+        )
+
+    def _parse_audio_track(self, track: dict[str, Any], index: int) -> AudioTrack:
+        path = str(track["contentUrl"])
+        file_id = _optional_unsigned_integer(track.get("ino"))
+        if file_id is None:
+            item_path, _, file_part = urlparse(path).path.rpartition("/file/")
+            if "/api/items/" in item_path:
+                file_id = _optional_unsigned_integer(file_part)
+        metadata = track.get("metadata")
+        return AudioTrack(
+            index=int(track.get("index") or index + 1),
+            start_offset=float(track.get("startOffset") or 0),
+            duration=float(track.get("duration") or 0),
+            url=self.authenticated_media_url(path),
+            title=str(track.get("title") or ""),
+            file_id=file_id,
+            size_bytes=(
+                _optional_unsigned_integer(metadata.get("size"))
+                if isinstance(metadata, dict)
+                else None
+            ),
         )
 
     def sync_session_progress(
@@ -386,6 +493,8 @@ class AudiobookshelfClient:
         duration: float,
         session_id: str = "",
         time_listened: float = 0,
+        *,
+        episode_id: str = "",
     ) -> None:
         progress = min(max(current_time / duration, 0), 1) if duration else 0
         errors: list[AudiobookshelfError] = []
@@ -401,7 +510,7 @@ class AudiobookshelfClient:
         try:
             self.request(
                 "PATCH",
-                f"/api/me/progress/{item_id}",
+                f"/api/me/progress/{progress_item_path(item_id, episode_id)}",
                 body={
                     "duration": duration,
                     "progress": progress,
@@ -417,31 +526,58 @@ class AudiobookshelfClient:
             raise errors[0]
 
 
-def primary_series_from_metadata(metadata: dict[str, Any]) -> tuple[str, str]:
+def progress_item_path(item_id: str, episode_id: str) -> str:
+    item = quote(item_id, safe="")
+    return f"{item}/{quote(episode_id, safe='')}" if episode_id else item
+
+
+def server_position(progress: dict[str, Any] | None) -> tuple[float, int] | None:
+    """Read a usable position, including an intentional rewind to zero."""
+    if not isinstance(progress, dict):
+        return None
+    seconds = progress.get("currentTime")
+    if type(seconds) not in (int, float) or seconds < 0 or not math.isfinite(seconds):
+        return None
+    return float(seconds), _optional_unsigned_integer(progress.get("lastUpdate")) or 0
+
+
+def _optional_unsigned_integer(value: Any) -> int | None:
+    if isinstance(value, (int, str)) and re.fullmatch(r"[0-9]{1,20}", str(value)):
+        return int(value)
+    return None
+
+
+def series_memberships_from_metadata(metadata: dict[str, Any]) -> tuple[SeriesMembership, ...]:
     raw_series = metadata.get("series") or []
     if isinstance(raw_series, dict):
         raw_series = [raw_series]
 
-    entries: list[tuple[str, str]] = []
+    entries: list[SeriesMembership] = []
     if isinstance(raw_series, list):
         for value in raw_series:
             if not isinstance(value, dict):
                 continue
             name = str(value.get("name") or value.get("series") or "").strip()
             if name:
-                entries.append((name, normalized_series_sequence(value.get("sequence"))))
+                entries.append(SeriesMembership(str(value.get("id") or ""), name,
+                                                normalized_series_sequence(value.get("sequence"))))
 
-    for entry in entries:
-        if entry[1]:
-            return entry
     if entries:
-        return entries[0]
+        return tuple(entries)
 
     legacy = str(metadata.get("seriesName") or "").strip()
     match = re.match(r"^(.*?)\s+#\s*(\d+(?:\.\d+)?)\s*$", legacy)
     if match:
-        return match.group(1).strip(), normalized_series_sequence(match.group(2))
-    return (legacy, "") if legacy else ("", "")
+        return (SeriesMembership("", match.group(1).strip(), normalized_series_sequence(match.group(2))),)
+    return (SeriesMembership("", legacy),) if legacy else ()
+
+
+def primary_series_from_metadata(metadata: dict[str, Any]) -> tuple[str, str]:
+    entries = series_memberships_from_metadata(metadata)
+    if not entries:
+        return "", ""
+    entry = next((member for member in entries if member.sequence), entries[0])
+    return entry.name, entry.sequence
 
 
 def normalized_series_sequence(value: Any) -> str:
@@ -506,6 +642,13 @@ def progress_current_time(*sources: dict[str, Any]) -> float:
                 return current_time
             fallback = current_time
     return fallback
+
+
+def narrator_from_metadata(metadata: dict[str, Any]) -> str:
+    names = metadata.get("narrators")
+    if isinstance(names, list):
+        return ", ".join(name for name in names if isinstance(name, str) and name)
+    return str(metadata.get("narratorName") or "")
 
 
 def author_from_metadata(metadata: dict[str, Any]) -> str:
@@ -601,8 +744,9 @@ def client_from_config(config: Any, client_factory=AudiobookshelfClient) -> Audi
         return client_factory(config.server_url, config.token)
 
     from .config import saved_auth_tokens, update_auth_tokens
+    from .progress_sync import progress_account
 
-    return client_factory(
+    client = client_factory(
         config.server_url,
         config.token,
         refresh_token=config.refresh_token,
@@ -614,3 +758,5 @@ def client_from_config(config: Any, client_factory=AudiobookshelfClient) -> Audi
             refresh_token,
         ),
     )
+    client.progress_account = progress_account(config)
+    return client

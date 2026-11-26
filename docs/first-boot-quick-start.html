@@ -53,7 +53,7 @@
       box-shadow: var(--shadow);
       padding: 0.48in;
       display: grid;
-      grid-template-rows: auto 4.55in auto auto;
+      grid-template-rows: auto minmax(0, 1fr) auto auto auto;
       gap: 0.22in;
     }
 
@@ -81,9 +81,10 @@
     }
 
     .badge {
-      width: 1.28in;
-      height: 1.28in;
-      border-radius: 50%;
+      width: auto;
+      height: auto;
+      padding: 0.12in 0.18in;
+      border-radius: 6px;
       background: var(--ink);
       color: #fff;
       display: grid;
@@ -91,8 +92,7 @@
       text-align: center;
       font-size: 13px;
       font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.03em;
     }
 
     .hero-stage {
@@ -255,7 +255,7 @@
     }
 
     .step h2 {
-      margin: 0 0 0.08in;
+      margin: 0.10in 0 0.08in;
       font-size: 18px;
       line-height: 1.1;
       letter-spacing: 0;
@@ -368,17 +368,26 @@
       70% { transform: rotate(-18deg); }
     }
 
-    @media screen and (max-width: 900px) {
-      body {
-        padding: 12px;
-        align-items: start;
-      }
-
+    @media screen and (max-width: 850px) {
+      body { display: block; }
       .sheet {
-        transform: scale(calc((100vw - 24px) / 816));
-        transform-origin: top center;
-        margin-bottom: calc(11in * -0.15);
+        width: 100%;
+        height: auto;
+        padding: clamp(1rem, 4vw, 2.5rem);
+        grid-template-rows: auto;
       }
+      .hero-stage { min-height: clamp(220px, 48vw, 380px); }
+      .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 1.6rem; }
+      .step { min-height: 0; }
+      code { overflow-wrap: anywhere; }
+    }
+
+    @media screen and (max-width: 520px) {
+      h1 { font-size: 32px; }
+      .badge { font-size: 10px; }
+      .controls { grid-template-columns: 1fr; }
+      .setup-card { display: none; }
+      footer { flex-direction: column; }
     }
 
     @media print {
@@ -408,9 +417,9 @@
     <header>
       <div>
         <h1>Chapter<br>Quick Start</h1>
-        <p class="tagline">First boot setup for your audiobook player</p>
+        <p class="tagline">Wi-Fi, first playback and the two knobs</p>
       </div>
-      <div class="badge">Keep This Card</div>
+      <div class="badge">Pi build<br>c55b1297bd83</div>
     </header>
 
     <section class="hero-stage" aria-label="Chapter Player setup overview">
@@ -423,28 +432,28 @@
       </div>
       <div class="wifi-burst" aria-hidden="true"><span></span><span></span><span></span></div>
       <div class="setup-card" aria-hidden="true">
-        <strong>Join Setup Wi-Fi</strong>
+        <strong>Setup hotspot</strong>
         <code>Chapter-Setup</code>
-        <span>Then open the address on the screen.</span>
+        <span>Open on your phone only if Chapter shows this network.</span>
       </div>
     </section>
 
     <section class="steps" aria-label="First boot steps">
       <article class="step" data-step="1">
-        <h2>Join Setup Wi-Fi</h2>
-        <p>On your phone or computer, connect to <code>Chapter-Setup</code>.</p>
+        <h2>On home Wi-Fi?</h2>
+        <p>On the same network, open the OLED address or <code>http://chapter-player.local</code>. Go to step 3.</p>
       </article>
       <article class="step" data-step="2">
-        <h2>Open The Address</h2>
-        <p>In a browser, enter the address shown on the player screen.</p>
+        <h2>On Chapter-Setup?</h2>
+        <p>Join it and open <code>http://10.42.0.1</code>. In <b>Connections</b>, add home Wi-Fi. Rejoin home Wi-Fi on your phone.</p>
       </article>
       <article class="step" data-step="3">
-        <h2>Add Home Wi-Fi</h2>
-        <p>Enter your Wi-Fi name and password, then submit.</p>
+        <h2>Sign in</h2>
+        <p>Open Chapter on home Wi-Fi. In <b>Connections → Audiobookshelf</b>, enter the server address and player login.</p>
       </article>
       <article class="step" data-step="4">
-        <h2>Add Audiobookshelf</h2>
-        <p>Enter the server address and player account login.</p>
+        <h2>Play a book</h2>
+        <p>Turn Select to a title and click. Choose <b>Start</b> or <b>Continue</b>. To stop and save your place, choose <b>... → Stop playback</b>.</p>
       </article>
     </section>
 
@@ -466,8 +475,8 @@
     </section>
 
     <footer>
-      <div><strong>Tip:</strong> If setup is needed later, hold the Volume knob for 10 seconds.</div>
-      <div>After setup, the player shows your library or playback screen.</div>
+      <div><strong>Dark screen?</strong> Turn or press either knob once to wake it. Use the next gesture to make a change.</div>
+      <div>On a phone, use the top-right menu to open Library, Player or Settings.</div>
     </footer>
   </main>
 </body>

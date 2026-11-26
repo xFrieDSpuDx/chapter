@@ -1,59 +1,33 @@
-# Chapter Player First Boot One-Sheet
+# Chapter Player first boot
 
-Use this sheet when turning on a Chapter Player for the first time.
+Have your phone, the name and password of your 2.4 GHz home Wi-Fi, and the server address and login for the player’s Audiobookshelf account handy. Power on Chapter.
 
-## What You Need
+## Connect to your player
 
-- A phone, tablet, or computer.
-- Your home Wi-Fi network name and password.
-- The Audiobookshelf server address and player account login, if the setup page asks for them.
+| What Chapter shows | What to do on your phone |
+| --- | --- |
+| A home-network address, or the library | Join the same home Wi-Fi. Open the address on the OLED, or `http://chapter-player.local` with the standard hostname. If the library already has your books, you can start listening. |
+| **Chapter-Setup** | Join the open **Chapter-Setup** network and browse to `http://10.42.0.1`. In **Connections**, enter your home Wi-Fi details and choose **Connect to Wi-Fi**. Rejoin home Wi-Fi on the phone, then open Chapter again at its home-network address. |
+| A dark screen on a configured player | Press or turn either knob once to wake it. The next gesture controls the player. Hold **Volume** for ten seconds to display the setup address. |
 
-## Connect The Player To Wi-Fi
+On a phone, the three-line menu at the top right opens **Connections** and the other pages. **Checking Wi-Fi…** can appear briefly while the page gets the connection status.
 
-1. Turn on the Chapter Player.
-2. Wait for the screen to show the setup Wi-Fi network and setup address.
-3. On your phone, tablet, or computer, connect to this Wi-Fi network:
+## Play your first book
 
-```text
-Chapter-Setup
-```
+1. Open **Connections → Audiobookshelf**. Enter the server URL and the dedicated player account credentials. Choose **Log in to Audiobookshelf**. If the wrong library appears, use **Settings → Books → Audiobookshelf library → Use library**.
+2. On the player, turn **Select** (left knob) to a book and click. Choose **Start** for a new book or **Continue** to resume. **Start over** begins a book with listening history from the beginning.
+3. Turn **Volume** (right knob) to adjust the sound. Click once to mute or unmute.
 
-4. Open a browser and go to the address shown on the Chapter Player screen.
-5. Enter your home Wi-Fi network name and password.
-6. Submit the form and wait while the Chapter Player joins your Wi-Fi.
+To protect the browser controls, open **Settings → Security → Require owner login** after filling in the owner details. This login is for the Chapter web interface. Keep the player on your trusted home network.
 
-## Add Audiobookshelf Server Info
+## Control the same book from either place
 
-1. Open the setup page again if it does not reconnect automatically.
-2. Enter the Audiobookshelf server address.
-3. Enter the username and password for the player account.
-4. Submit the form and wait for the player to connect.
+| What you want to do | On Chapter | In the browser |
+| --- | --- | --- |
+| Cancel a book you just selected | Click **Select** while the opening prompt is visible. | Press **×** on the cover or **Player → Cancel opening**. |
+| Pause and keep the book open | Choose **Pause**. Choose **Play** to resume. | Open **Player** and press the central pause or play button. |
+| Close the book and keep your place | Choose **... → Stop playback**. | Choose **Player → Session → Stop playback**. |
 
-After setup is complete, the Chapter Player should show the library or playback screen.
+The phone controls the speaker on Chapter. Hold **Select** for three seconds to open Bluetooth and choose **Speakers** to pair an external speaker. To find a series, jump to a letter or use a sleep timer, see the [listening guide](listening-guide.md). For playing away from Wi-Fi, see [offline listening](downloads-and-offline-listening.md).
 
-## The Two Knobs
-
-### Select Knob
-
-- Turn: move through books, menu items, or playback actions.
-- Click: select the highlighted item.
-- Hold for 3 seconds: open the Bluetooth menu.
-
-### Volume Knob
-
-- Turn: change volume.
-- Click: mute or unmute.
-- Hold for 10 seconds: show the setup address on the screen.
-
-## Menus And Playback
-
-- In any menu, turn the Select knob to move and click it to choose.
-- When choosing a book with listening history, select `Continue` or `Start over`.
-- During playback, use the Select knob to choose `Home`, `Prev`, `Play/Pause`, or `Next`.
-- `Prev` and `Next` may ask you to confirm before changing chapters.
-- In the Bluetooth menu, choose `Enable`, `Disable`, `Pair`, `Unpair`, or `Back`.
-- To pair Bluetooth audio, put the speaker or headphones in pairing mode, choose `Pair`, select the device name, and click to connect.
-
-## If Setup Is Needed Later
-
-Hold the Volume knob for 10 seconds. The Chapter Player will show its setup address on the screen.
+[Print the one-page quick start card](first-boot-quick-start.pdf)

@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import time
 
-from .appliance_io import Sh1122Display
-from .rotary_ui import TwoLineFrame, WifiSetupFrame
+from .display_frames import TwoLineFrame, WifiSetupFrame
+from .oled_display import Sh1122Display
 from .wifi import SETUP_HOTSPOT_SSID, SETUP_HOTSPOT_URL
 
 

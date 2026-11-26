@@ -1,0 +1,16 @@
+<section class="divider-section">
+  <p class="muted">{used:.0f} MiB used of {limit} MiB allowed. {free:.0f} MiB free on the device.</p>
+  <form class="form-stack" action="/settings/downloads" method="post">
+    {csrf}
+    <label class="check-field">
+      <input type="checkbox" name="prefer_downloaded" value="1"{prefer_downloaded}>
+      <span>Prefer downloaded books</span>
+    </label>
+    <div class="field-action short-form">
+      <label class="field">Download limit (MiB)
+        <input type="number" name="download_limit_mib" min="1" max="1048576" value="{limit}" required>
+      </label>
+      <button type="submit">Save settings</button>
+    </div>
+  </form>
+</section>
