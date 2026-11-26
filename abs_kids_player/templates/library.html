@@ -1,0 +1,43 @@
+<header class="page-heading">
+  <h1>{heading}</h1>
+  <p class="muted" data-library-total>{total}</p>
+  {space}
+  {queue_link}
+</header>
+<div class="divider-stack" data-download-page data-library-section="{section}">
+  <p class="sr-only" role="status" data-download-announcement></p>
+  {download_queue}
+  <section class="divider-section library-browser" aria-labelledby="browse-books">
+    <form class="library-filters" action="/library" method="get" aria-label="Library filters">
+      <input name="section" type="hidden" value="{section}">
+      <input name="group" type="hidden" value="{group}">
+      <input name="group_view" type="hidden" value="{view}">
+      <div class="library-filter-fields">
+        <div class="field">
+          <label for="library-view">Browse by</label>
+          <select id="library-view" name="view">{browse_options}</select>
+        </div>
+        <div class="field">
+          <label for="library-search">Search</label>
+          <input id="library-search" name="q" type="search" value="{query}" maxlength="200" placeholder="Find a book">
+        </div>
+      </div>
+      <div class="library-flags">
+        <label class="check-field"><input name="downloaded" type="checkbox" value="1"{checked}><span>Downloaded only</span></label>
+        <label class="check-field"><input name="hide_downloaded" type="checkbox" value="1"{hide_downloaded}><span>Hide downloaded</span></label>
+        <label class="check-field"><input name="hide_finished" type="checkbox" value="1"{hide_finished}><span>Hide finished</span></label>
+      </div>
+      <button class="library-apply" type="submit">Apply filters</button>
+    </form>
+    <p class="hint" role="status" data-library-feedback hidden></p>
+    <p class="hint" role="status" data-library-connection hidden></p>
+    {results}
+  </section>
+  <dialog class="book-dialog card" data-book-dialog aria-labelledby="book-dialog-title">
+    <header class="book-dialog-header">
+      <h2 id="book-dialog-title">Book details</h2>
+      <form method="dialog"><button class="secondary book-dialog-close" aria-label="Close book details">×</button></form>
+    </header>
+    <div class="book-dialog-body" data-book-dialog-content></div>
+  </dialog>
+</div>

@@ -1,0 +1,32 @@
+<header class="page-heading"><h1>Audio output</h1></header>
+<section class="divider-section">
+  <dl class="status row-dividers">
+    <div class="status-row"><dt>Playback output</dt><dd>{audio_output}</dd></div>
+    <div class="status-row"><dt>Bluetooth</dt><dd>{bluetooth}</dd></div>
+  </dl>
+  <p class="hint">The test plays a short chime at low volume. Test Bluetooth before opening a book so the output is free.</p>
+  <form class="form-footer" method="post" action="/settings/audio-test">
+    {csrf}
+    <button class="secondary" name="output" value="speaker">Test speaker</button>
+    <button class="secondary" name="output" value="bluetooth">Test Bluetooth</button>
+  </form>
+  <p id="audio-test-result" class="muted" role="status" data-request="{pending_id}">{result}</p>
+</section>
+<script>
+const result = document.getElementById("audio-test-result");
+if (result.dataset.request) {{
+  const until = Date.now() + 12000;
+  async function checkResult() {{
+    try {{
+      const response = await fetch("/player/command?id=" + encodeURIComponent(result.dataset.request), {{cache: "no-store"}});
+      if (response.ok && (await response.json()).outcome !== "queued") {{
+        window.location.reload();
+        return;
+      }}
+    }} catch {{ /* Retry while the page is waiting. */ }}
+    if (Date.now() < until) window.setTimeout(checkResult, 400);
+    else result.textContent = "The player did not report a test result. Check that the OLED service is running.";
+  }}
+  window.setTimeout(checkResult, 400);
+}}
+</script>

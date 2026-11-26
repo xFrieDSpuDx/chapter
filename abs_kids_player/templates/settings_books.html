@@ -1,0 +1,20 @@
+<div class="divider-stack">
+  <form class="divider-section form-stack" method="post" action="/settings/books">
+    {csrf}
+    <div class="field-grid">
+      <label class="field">Library order
+        <select name="library_sort_mode">{library_sort_options}</select>
+      </label>
+      <label class="field">Playback speed
+        <select name="playback_speed">{playback_speed_options}</select>
+      </label>
+    </div>
+    <div class="form-footer"><button type="submit">Save book settings</button></div>
+  </form>
+  <section class="divider-section">
+    <nav class="resource-list row-dividers" aria-label="Library options">
+      <a class="resource-link" href="/settings/catalogue"><span><strong>Audiobookshelf library</strong>{library_name}</span></a>
+      <a class="resource-link" href="/settings/shelves"><strong>Choose a pinned shelf</strong></a>
+    </nav>
+  </section>
+</div>

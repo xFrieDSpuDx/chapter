@@ -1,0 +1,112 @@
+:root, [data-palette="taupe-gold"] {
+  --canvas: light-dark(#f8f3f0, #211916);
+  --paper: light-dark(#e5d8cf, #2e231f);
+  --field: light-dark(#fdf9f7, #3b2e28);
+  --tint: light-dark(#d8c9bd, #4d392c);
+  --line: light-dark(#cbb8a9, #604d41);
+  --field-border: light-dark(#8c7668, #a48a79);
+  --ink: light-dark(#241b18, #f8ede4);
+  --muted: light-dark(#51423a, #dbc9b9);
+  --primary: light-dark(#685147, #d9b376);
+  --primary-ink: light-dark(#f8f3f0, #302014);
+  --accent: light-dark(#452706, #ebc790);
+}
+
+[data-palette="fjord"] {
+  --canvas: light-dark(#edf3f9, #101c29);
+  --paper: light-dark(#f9fcff, #172635);
+  --field: light-dark(#fff, #213244);
+  --tint: light-dark(#dbe8f4, #243d53);
+  --line: light-dark(#c9d8e7, #354d62);
+  --field-border: light-dark(#758ca5, #647f98);
+  --ink: light-dark(#192b40, #edf6ff);
+  --muted: light-dark(#496179, #afc5da);
+  --primary: light-dark(#245789, #8bc4fb);
+  --primary-ink: light-dark(#fff, #102438);
+  --accent: light-dark(#194f83, #aed6ff);
+}
+
+[data-palette="juniper"] {
+  --canvas: light-dark(#eaf3ef, #11231f);
+  --paper: light-dark(#f8fcfa, #19302a);
+  --field: light-dark(#fff, #233c34);
+  --tint: light-dark(#cee8dc, #234c40);
+  --line: light-dark(#c2d9cf, #375b50);
+  --field-border: light-dark(#648878, #668b79);
+  --ink: light-dark(#182e27, #edf9f4);
+  --muted: light-dark(#44665a, #b1cbbf);
+  --primary: light-dark(#176348, #83dbb3);
+  --primary-ink: light-dark(#fff, #112b21);
+  --accent: light-dark(#115d43, #a4eac9);
+}
+
+[data-palette="plum-linen"] {
+  --canvas: light-dark(#f5eff6, #241a2b);
+  --paper: light-dark(#fffbff, #31243a);
+  --field: light-dark(#fff, #3d3048);
+  --tint: light-dark(#eadcf0, #493151);
+  --line: light-dark(#dfcfe3, #584663);
+  --field-border: light-dark(#987d9d, #967d9f);
+  --ink: light-dark(#302339, #fff1fb);
+  --muted: light-dark(#685371, #d1bed9);
+  --primary: light-dark(#723d80, #dfb4ec);
+  --primary-ink: light-dark(#fff, #331a3e);
+  --accent: light-dark(#71387d, #edc4f5);
+}
+
+[data-palette="terracotta"] {
+  --canvas: light-dark(#f8eee7, #2b1b18);
+  --paper: light-dark(#fff8f2, #392722);
+  --field: light-dark(#fffcf8, #46302a);
+  --tint: light-dark(#f3dbce, #543327);
+  --line: light-dark(#e9cfc0, #65473b);
+  --field-border: light-dark(#a47c68, #a47b68);
+  --ink: light-dark(#36231c, #fff2e9);
+  --muted: light-dark(#715346, #ddc0b0);
+  --primary: light-dark(#954630, #f2aa8b);
+  --primary-ink: light-dark(#fff, #331b15);
+  --accent: light-dark(#863b27, #ffc0a4);
+}
+
+[data-palette="monochrome"] {
+  --canvas: light-dark(#f0f0f0, #181819);
+  --paper: light-dark(#fcfcfc, #242425);
+  --field: light-dark(#fff, #303031);
+  --tint: light-dark(#e1e1e2, #3b3b3d);
+  --line: light-dark(#d3d3d4, #454547);
+  --field-border: light-dark(#818182, #79797c);
+  --ink: light-dark(#232324, #f7f7f7);
+  --muted: light-dark(#565658, #bbbbbe);
+  --primary: light-dark(#282829, #e6e6e7);
+  --primary-ink: light-dark(#fff, #232324);
+  --accent: light-dark(#303032, #f6f6f6);
+}
+
+[data-palette="tangerine-charcoal"] {
+  --canvas: light-dark(#f5f2ed, #1f1f1f);
+  --paper: light-dark(#fdfaf6, #2a2a2a);
+  --field: light-dark(#fff, #2a2a2a);
+  --tint: light-dark(#ffe9cb, #3c3020);
+  --line: light-dark(#e0d7ca, #444);
+  --field-border: light-dark(#8d7c68, #858585);
+  --ink: light-dark(#212121, #fff);
+  --muted: light-dark(#5d5550, #ccc);
+  --primary: #ff9900;
+  --primary-ink: #191919;
+  --accent: light-dark(#804100, #ffd29a);
+}
+
+[data-palette="midnight-brass"] {
+  --canvas: light-dark(oklch(.975 0 0), oklch(.125 .018 245));
+  --paper: light-dark(oklch(1 0 0), oklch(.18 .022 245));
+  --field: light-dark(oklch(1 0 0), oklch(.205 .022 245));
+  --tint: light-dark(#f5ead4, #31291e);
+  --line: light-dark(#d7d7d7, #313b45);
+  --field-border: light-dark(oklch(.64 0 0), oklch(.51 .03 245));
+  --ink: light-dark(oklch(.18 0 0), oklch(.96 .008 245));
+  --muted: light-dark(oklch(.43 0 0), oklch(.73 .022 245));
+  --primary: oklch(.76 .14 75);
+  --primary-ink: oklch(.16 .025 245);
+  --accent: light-dark(oklch(.46 .17 55), oklch(.8 .125 78));
+  --palette-glow: radial-gradient(ellipse at 15% 20%, color-mix(in srgb, var(--primary) 13%, transparent), transparent 32rem);
+}

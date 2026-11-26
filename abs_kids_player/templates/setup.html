@@ -1,0 +1,46 @@
+<div data-dashboard data-restore-tab="{restore_tab}">
+  {message}
+  <section class="dashboard-panel" data-tab-panel="overview"{overview_hidden}>
+    <header class="page-heading"><h1>Overview</h1></header>
+    {status_panel}
+  </section>
+  <section class="dashboard-panel" data-tab-panel="settings"{settings_hidden}>
+    <header class="page-heading"><h1>Settings</h1></header>
+    {settings_card}
+  </section>
+  <section class="dashboard-panel" data-tab-panel="podcasts"{podcasts_hidden}>
+    <header class="page-heading"><h1>Podcasts</h1></header>
+    {podcasts_card}
+  </section>
+  <section class="dashboard-panel" data-tab-panel="connections"{connections_hidden}>
+    <header class="page-heading"><h1>Connections</h1></header>
+    <div class="divider-stack">
+      {wifi_card}
+      <section class="divider-section" aria-labelledby="audiobookshelf-heading">
+        <h2 id="audiobookshelf-heading">Audiobookshelf</h2>
+        <p class="hint">Chapter stores the token returned by your Audiobookshelf server.</p>
+        <form class="form-stack connection-form" method="post" action="/login">
+          {csrf_input}
+          <label class="field" for="server_url">Audiobookshelf server URL
+            <input id="server_url" name="server_url" value="{server_url}" placeholder="https://books.example.com" inputmode="url" autocapitalize="none" spellcheck="false" required>
+          </label>
+          <label class="field" for="username">Username
+            <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+          </label>
+          <label class="field" for="password">Password
+            <input id="password" name="password" type="password" autocomplete="current-password" required>
+          </label>
+          <button type="submit">Log in to Audiobookshelf</button>
+        </form>
+      </section>
+      <section class="divider-section" aria-labelledby="audio-heading">
+        <h2 id="audio-heading">Audio output</h2>
+        <a class="resource-link" href="/settings/audio-output"><strong>Check output and test sound</strong></a>
+      </section>
+    </div>
+  </section>
+  <section class="dashboard-panel" data-tab-panel="system"{system_hidden}>
+    <header class="page-heading"><h1>System</h1></header>
+    {system_card}
+  </section>
+</div>
