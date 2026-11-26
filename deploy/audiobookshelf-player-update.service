@@ -5,13 +5,14 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/chapter/audiobookshelf-player
-Environment=HOME=/home/chapter
+WorkingDirectory=/opt/chapter-player/git
+Environment=HOME=/root
+Environment="CHAPTER_REPO_URL=https://github.com/chrismtopher/chapter.git"
 Environment=CHAPTER_INSTALL_USER=chapter
-Environment=CHAPTER_INSTALL_DIR=/home/chapter/audiobookshelf-player
+Environment=CHAPTER_INSTALL_DIR=/opt/chapter-player/git
 Environment=ABS_KIDS_PLAYER_STATE_DIR=/home/chapter/.local/state/abs-kids-player
 Environment=ABS_KIDS_PLAYER_STORAGE_OWNER=chapter
-ExecStart=/usr/bin/python3 -m abs_kids_player.software_update install
-TimeoutStartSec=45min
+ExecStart=/usr/bin/python3 -EsB -m abs_kids_player.software_update install
+TimeoutStartSec=50min
 Nice=10
 IOSchedulingClass=idle

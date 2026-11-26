@@ -1,4 +1,6 @@
 [Unit]
+Requires=audiobookshelf-player-update-recovery.service
+After=audiobookshelf-player-update-recovery.service
 Description=Chapter Player for Audiobookshelf OLED appliance display
 DefaultDependencies=no
 Wants=audiobookshelf-player-boot-splash.service
@@ -8,7 +10,10 @@ Before=basic.target
 [Service]
 Type=simple
 User=chapter
-WorkingDirectory=/home/chapter/audiobookshelf-player
+WorkingDirectory=/opt/chapter-player/git
+RuntimeDirectory=chapter-oled-gpio
+RuntimeDirectoryMode=0700
+Environment=LG_WD=/run/chapter-oled-gpio
 Environment=HOME=/home/chapter
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -m abs_kids_player.oled_service --boot-splash-handoff-path=

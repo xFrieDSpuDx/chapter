@@ -6,9 +6,13 @@ Before=basic.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/chapter/audiobookshelf-player
+WorkingDirectory=/opt/chapter-player/git
+RuntimeDirectory=chapter-splash-gpio
+RuntimeDirectoryMode=0700
+Environment=LG_WD=/run/chapter-splash-gpio
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 -m abs_kids_player.boot_splash --hold-seconds 0.1
+Environment=ABS_KIDS_PLAYER_CONFIG_DIR=/home/chapter/.config/abs-kids-player
+ExecStart=/usr/bin/python3 -EsB -m abs_kids_player.boot_splash --hold-seconds 0.1
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal

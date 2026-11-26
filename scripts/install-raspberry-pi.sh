@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+# Chapter install layout: root-owned-v1
 set -euo pipefail
+umask 022
 
-REPO_URL="${CHAPTER_REPO_URL:-https://github.com/chrismtopher/chapter.git}"
+DEFAULT_REPO_URL="https://github.com/chrismtopher/chapter.git"
+REPO_URL="${CHAPTER_REPO_URL:-}"
 RELEASE_REF="${CHAPTER_RELEASE_REF:-v0.3.12}"
 INSTALL_USER="${CHAPTER_INSTALL_USER:-chapter}"
 INSTALL_DIR="${CHAPTER_INSTALL_DIR:-}"
@@ -42,6 +45,7 @@ SERVICES=(
   audiobookshelf-player-setup.service
   audiobookshelf-player-port80-forward.service
   audiobookshelf-player-bluetooth-unblock.service
+  audiobookshelf-player-update-recovery.service
 )
 
 usage() {
@@ -55,10 +59,11 @@ Options:
   --yes              Do not prompt; reboot automatically at the end.
   --no-reboot        Do not reboot at the end.
   --force            Skip the Raspberry Pi hardware check.
-  --repo-url URL     Git repository to clone. Default: ${REPO_URL}
+  --repo-url URL     Repository used for installation and future updates.
+                     Defaults to the installed origin or ${DEFAULT_REPO_URL}.
   --release-ref REF  Release tag or commit to install. Default: ${RELEASE_REF}
   --user USER        Service user. Default: ${INSTALL_USER}
-  --install-dir DIR  Install directory. Default: /home/${INSTALL_USER}/audiobookshelf-player
+  --install-dir DIR  Install directory. Default: /opt/chapter-player/git
   -h, --help         Show this help.
 
 Environment overrides:
@@ -112,7 +117,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$INSTALL_DIR" ]]; then
-  INSTALL_DIR="/home/${INSTALL_USER}/audiobookshelf-player"
+  INSTALL_DIR="/opt/chapter-player/git"
 fi
 
 log() {
@@ -230,14 +235,52 @@ install_packages() {
   sudo_run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_PACKAGES[@]}"
 }
 
+check_install_path() {
+  local path="$INSTALL_DIR" owner_mode mode
+  [[ "$path" == /* && "$path" != */ && "$path" != *//* && "$path/" != *"/../"* && "$path/" != *"/./"* ]] ||
+    die "Use an absolute path to a dedicated release directory."
+  while [[ "$path" != "/" ]]; do
+    [[ ! -L "$path" ]] || die "A release directory cannot be a symbolic link: $path"
+    if [[ -e "$path" ]]; then
+      owner_mode="$(stat -c '%u %a' -- "$path")"
+      mode="${owner_mode#* }"
+      [[ -d "$path" && "${owner_mode%% *}" == 0 ]] && (( (8#$mode & 022) == 0 )) ||
+        die "Release directories and their parents must be owned by root and writable only by root: $path"
+    fi
+    path="$(dirname "$path")"
+  done
+  if [[ -e "$INSTALL_DIR" && ! -f "$INSTALL_DIR/.git/chapter-managed" ]]; then
+    die "Choose an empty destination for a new managed checkout. Keep the existing installation for rollback."
+  fi
+}
+
+release_git() {
+  sudo_run env HOME=/root git "$@"
+}
+
+resolve_repository() {
+  if [[ -z "$REPO_URL" && -d "${INSTALL_DIR}/.git" ]]; then
+    REPO_URL="$(release_git -C "$INSTALL_DIR" remote get-url origin)" ||
+      die "Could not find the installed repository. Specify it with --repo-url."
+  fi
+  REPO_URL="${REPO_URL:-$DEFAULT_REPO_URL}"
+  if [[ "$REPO_URL" == -* || "$REPO_URL" == *[[:cntrl:]]* ]]; then
+    die "Invalid release repository URL."
+  fi
+}
+
 sync_project() {
   log "Installing project into ${INSTALL_DIR}"
-  sudo_run install -d -o "$INSTALL_USER" -g "$INSTALL_USER" "$(dirname "$INSTALL_DIR")"
+  sudo_run mkdir -p -- "$(dirname "$INSTALL_DIR")"
 
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
-    sudo_run chown -R "$INSTALL_USER:$INSTALL_USER" "$INSTALL_DIR"
-    as_install_user git -C "$INSTALL_DIR" fetch --tags origin
-    as_install_user git -C "$INSTALL_DIR" checkout --force --detach "$RELEASE_REF"
+    local target="$RELEASE_REF"
+    if [[ ! "$target" =~ ^([[:xdigit:]]{40}|[[:xdigit:]]{64})$ ]] ||
+      ! release_git -C "$INSTALL_DIR" cat-file -e "${target}^{commit}"; then
+      release_git -C "$INSTALL_DIR" fetch --no-tags -- "$REPO_URL" "$RELEASE_REF"
+      target=FETCH_HEAD
+    fi
+    release_git -C "$INSTALL_DIR" checkout --force --detach "$target"
     return
   fi
 
@@ -245,8 +288,16 @@ sync_project() {
     die "${INSTALL_DIR} already exists but is not a Git checkout. Move it aside or set CHAPTER_INSTALL_DIR."
   fi
 
-  as_install_user git clone --no-checkout "$REPO_URL" "$INSTALL_DIR"
-  as_install_user git -C "$INSTALL_DIR" checkout --detach "$RELEASE_REF"
+  # Publish only a fully checked out tree. An interrupted first install can be retried.
+  (
+    local staged
+    staged="$(sudo_run mktemp -d "$(dirname "$INSTALL_DIR")/.chapter-checkout.XXXXXXXX")"
+    trap 'sudo_run rm -rf -- "$staged"' EXIT
+    release_git clone --no-checkout -- "$REPO_URL" "$staged/tree"
+    release_git -C "$staged/tree" checkout --detach "$RELEASE_REF"
+    sudo_run touch "$staged/tree/.git/chapter-managed"
+    sudo_run mv -T -- "$staged/tree" "$INSTALL_DIR"
+  )
 }
 
 ensure_boot_config_line() {
@@ -315,6 +366,15 @@ EOF
   rm -f "$tmp"
 }
 
+install_service_file() {
+  local mode="$1" source="$2" destination="$3"
+  local staged="${destination}.new.$$"
+  sudo_run install -m "$mode" "$source" "$staged"
+  sudo_run sync "$staged"
+  sudo_run mv -f -- "$staged" "$destination"
+  sudo_run sync -f "$(dirname "$destination")"
+}
+
 install_services() {
   log "Installing systemd services"
   local deploy_dir="${INSTALL_DIR}/deploy"
@@ -330,11 +390,14 @@ install_services() {
   render_unit "${deploy_dir}/audiobookshelf-player-bluetooth-unblock.service" "${tmpdir}/audiobookshelf-player-bluetooth-unblock.service" "$home_dir"
   render_unit "${deploy_dir}/audiobookshelf-player-update.service" "${tmpdir}/audiobookshelf-player-update.service" "$home_dir"
 
-  sudo_run install -m 0644 "${tmpdir}/audiobookshelf-player-boot-splash.service" /etc/systemd/system/
-  sudo_run install -m 0644 "${tmpdir}/audiobookshelf-player-oled.service" /etc/systemd/system/
-  sudo_run install -m 0644 "${tmpdir}/audiobookshelf-player-setup.service" /etc/systemd/system/audiobookshelf-player-setup.service
-  sudo_run install -m 0644 "${tmpdir}/audiobookshelf-player-bluetooth-unblock.service" /etc/systemd/system/
-  sudo_run install -m 0644 "${tmpdir}/audiobookshelf-player-update.service" /etc/systemd/system/
+  local unit
+  for unit in boot-splash oled setup bluetooth-unblock update; do
+    install_service_file 0644 "${tmpdir}/audiobookshelf-player-${unit}.service" \
+      "/etc/systemd/system/audiobookshelf-player-${unit}.service"
+  done
+  install_service_file 0755 "${INSTALL_DIR}/abs_kids_player/update_recovery.py" /usr/local/sbin/chapter-update-recovery
+  install_service_file 0644 "${deploy_dir}/audiobookshelf-player-update-recovery.service" \
+    /etc/systemd/system/audiobookshelf-player-update-recovery.service
   sudo_run install -m 0755 "${deploy_dir}/audiobookshelf-player-port80-proxy" /usr/local/sbin/audiobookshelf-player-port80-proxy
   sudo_run install -m 0644 "${deploy_dir}/audiobookshelf-player-port80-forward.service" /etc/systemd/system/
 
@@ -349,24 +412,31 @@ install_services() {
 }
 
 sed_replacement() {
-  printf '%s' "$1" | sed 's/[&|]/\\&/g'
+  printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
 }
 
 render_unit() {
   local source="$1"
   local target="$2"
   local home_dir="$3"
-  local escaped_install_dir escaped_home_dir escaped_user
+  local escaped_install_dir escaped_home_dir escaped_user unit_repo escaped_repo
   escaped_install_dir="$(sed_replacement "$INSTALL_DIR")"
   escaped_home_dir="$(sed_replacement "$home_dir")"
   escaped_user="$(sed_replacement "$INSTALL_USER")"
+  # Environment= is a quoted systemd value. Literal percent signs use %%.
+  unit_repo="${REPO_URL//\\/\\\\}"
+  unit_repo="${unit_repo//\"/\\\"}"
+  unit_repo="${unit_repo//%/%%}"
+  escaped_repo="$(sed_replacement "$unit_repo")"
   sed \
     -e "s|/home/chapter/audiobookshelf-player|__CHAPTER_INSTALL_DIR__|g" \
+    -e "s|/opt/chapter-player/git|__CHAPTER_INSTALL_DIR__|g" \
     -e "s|/home/chapter|${escaped_home_dir}|g" \
     -e "s|__CHAPTER_INSTALL_DIR__|${escaped_install_dir}|g" \
     -e "s|^User=chapter$|User=${escaped_user}|g" \
     -e "s|CHAPTER_INSTALL_USER=chapter|CHAPTER_INSTALL_USER=${escaped_user}|g" \
     -e "s|ABS_KIDS_PLAYER_STORAGE_OWNER=chapter|ABS_KIDS_PLAYER_STORAGE_OWNER=${escaped_user}|g" \
+    -e "s|^Environment=\"CHAPTER_REPO_URL=.*\"$|Environment=\"CHAPTER_REPO_URL=${escaped_repo}\"|" \
     "$source" >"$target"
 }
 
@@ -407,8 +477,10 @@ maybe_reboot() {
 main() {
   require_raspberry_pi
   require_sudo
+  check_install_path
   install_packages
   ensure_user
+  resolve_repository
   prepare_storage_directories
   sync_project
   configure_spi_and_i2s

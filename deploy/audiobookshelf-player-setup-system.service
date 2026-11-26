@@ -1,15 +1,18 @@
 [Unit]
+Requires=audiobookshelf-player-update-recovery.service
+After=audiobookshelf-player-update-recovery.service
 Description=Audiobookshelf Player setup web page and Wi-Fi manager
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/chapter/audiobookshelf-player
+WorkingDirectory=/opt/chapter-player/git
+Environment="CHAPTER_REPO_URL=https://github.com/chrismtopher/chapter.git"
 Environment=ABS_KIDS_PLAYER_CONFIG_DIR=/home/chapter/.config/abs-kids-player
 Environment=ABS_KIDS_PLAYER_STATE_DIR=/home/chapter/.local/state/abs-kids-player
 Environment=ABS_KIDS_PLAYER_STORAGE_OWNER=chapter
-ExecStart=/usr/bin/python3 -m abs_kids_player.setup_server --ensure-wifi
+ExecStart=/usr/bin/python3 -EsB -m abs_kids_player.setup_server --ensure-wifi
 Restart=on-failure
 RestartSec=5
 

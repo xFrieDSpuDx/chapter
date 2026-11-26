@@ -14,6 +14,12 @@ log_command() {
 log_command "$@"
 
 case "$command_name" in
+  stat)
+    case "${!#}" in
+      "$MOCK_PI_ROOT/home/chapter") echo '1000 700' ;;
+      *) echo '0 755' ;;
+    esac
+    ;;
   sudo)
     if [[ "${1:-}" == "-v" ]]; then
       exit 0
@@ -26,7 +32,7 @@ case "$command_name" in
     fi
     exec "$@"
     ;;
-  apt-get|raspi-config|systemctl|usermod|chown)
+  apt-get|raspi-config|systemctl|usermod|chown|sync)
     exit 0
     ;;
   adduser)
@@ -91,6 +97,22 @@ case "$command_name" in
       fi
     fi
     /usr/bin/install "${args[@]}"
+    ;;
+  mv)
+    if [[ "${1:-}" == "-T" && "$(uname -s)" == Darwin ]]; then
+      shift
+      [[ "${1:-}" != "--" ]] || shift
+      [[ ! -e "$2" ]] || exit 1
+      exec /bin/mv "$1" "$2"
+    fi
+    args=()
+    for arg in "$@"; do
+      case "$arg" in
+        /etc/*|/usr/*) args+=("${MOCK_PI_ROOT}$arg") ;;
+        *) args+=("$arg") ;;
+      esac
+    done
+    /bin/mv "${args[@]}"
     ;;
   sed)
     if [[ "${1:-}" == "-i" ]]; then
