@@ -124,3 +124,29 @@ test("the download action keeps the book name and keyboard focus through a statu
   await cancel.press("Enter");
   await page.waitForFunction(() => /The River.*cancelled/i.test(document.querySelector("[data-download-announcement]").textContent));
 });
+
+test("the signed-in Overview sends its CSRF token when changing volume", async t => {
+  const {page, password} = await openChapter(t, 1100);
+  await signIn(page, password);
+  await page.goto("/library");
+  await page.getByRole("button", {name: "Play on Chapter, The River", exact: true}).press("Enter");
+  await page.getByRole("button", {name: "Pause on Chapter, The River", exact: true}).waitFor();
+  await page.goto("/?tab=overview");
+
+  const volume = page.getByRole("slider", {name: "Volume", exact: true});
+  const before = Number(await volume.inputValue());
+  const token = await page.locator('meta[name="chapter-csrf-token"]').getAttribute("content");
+  assert.ok(token);
+  const submitted = page.waitForResponse(response =>
+    new URL(response.url()).pathname === "/player" && response.request().method() === "POST");
+  await volume.press("ArrowRight");
+  const response = await submitted;
+  const fields = new URLSearchParams(response.request().postData());
+  assert.equal(fields.get("csrf_token"), token);
+  assert.equal(fields.get("action"), "volume");
+  assert.equal(fields.get("volume"), String(before + 1));
+  assert.equal(response.status(), 202);
+  await page.getByText("Applied.", {exact: true}).waitFor();
+  await page.reload();
+  assert.equal(await volume.inputValue(), String(before + 1));
+});

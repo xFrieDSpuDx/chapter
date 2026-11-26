@@ -4,12 +4,11 @@ import argparse
 import faulthandler
 import queue
 import signal
-import threading
 import time
 import traceback
 from concurrent.futures import Future
 from contextlib import ExitStack
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -26,11 +25,10 @@ from .audio_output_test import AUDIO_TEST_COMMAND, AudioOutputTest
 from .bedtime import BedtimeTimer, night_mode_active
 from .bluetooth_audio import (
     BluetoothActionResult,
-    bluetooth_powered,
-    connected_bluetooth_audio_device,
     preferred_bluetooth_alsa_device,
     set_bluetooth_power,
 )
+from .bluetooth_picker import SpeakerPicker
 from .build_info import log_installed_build
 from .catalogue_settings import (
     CATALOGUE_COMMAND,
@@ -44,16 +42,11 @@ from .config import (
     load_config,
 )
 from .device_status import DeviceStatusCache
-from .dial_timing import DialTiming
 from .display_frames import (
-    SCREEN_OFF,
     DisplayFrame,
     HomeFrame,
-    ScreenSaverFrame,
     SplashFrame,
     TwoLineFrame,
-    VolumeFrame,
-    WifiSetupFrame,
 )
 from .download_store import books_with_downloads
 from .gstreamer_runtime import GStreamerRuntime
@@ -74,16 +67,36 @@ from .listening_status import ListeningDetailsPublisher
 from .listening_timer import ListeningSleepTimer, SleepTimerEvent
 from .models import Book, PlaybackSession
 from .network import setup_address_frame
+from .oled_bluetooth import (
+    OledBluetooth,
+    start_bluetooth_power_worker,
+    start_bluetooth_status_worker,
+)
+from .oled_bluetooth import bluetooth_result_frame as bluetooth_result_frame
 from .oled_bookmarks import OledBookmarkPicker
 from .oled_catalogue import OledCatalogue
-from .oled_display import Sh1122Display, screen_saver_contrast_percent
+from .oled_display import Sh1122Display
 from .oled_input import (
     OledInputQueue,
-    consume_screen_saver_wake_input,
     drain_input_events,
     handle_oled_input_events,
     input_activity_seen,
 )
+from .oled_presentation import (
+    BOOK_LOADING_FRAME,
+    DEFAULT_ACTIVE_BRIGHTNESS_PERCENT,
+    DEFAULT_TITLE_SCROLL_DELAY_SECONDS,
+    DEFAULT_TITLE_SCROLL_PX_PER_SECOND,
+    OledPresentation,
+    splash_frame,
+)
+from .oled_presentation import frame_for_boot_state as frame_for_boot_state
+from .oled_presentation import frame_for_wifi_status as frame_for_wifi_status
+from .oled_presentation import frame_with_mute_indicator as frame_with_mute_indicator
+from .oled_presentation import frame_with_status_indicators as frame_with_status_indicators
+from .oled_presentation import refresh_home_cache as refresh_home_cache
+from .oled_presentation import scrolled_home_frame as scrolled_home_frame
+from .oled_presentation import update_display_brightness as update_display_brightness
 from .oled_shelf import OledShelf
 from .oled_web_status import (
     WebStatusPublisher,
@@ -121,7 +134,6 @@ from .rotary_ui import (
     ApplianceMenu,
     CommandType,
     MenuCommand,
-    Screen,
     SpokenSelection,
     book_is_podcast,
 )
@@ -129,9 +141,6 @@ from .screen_power import screen_off_due
 from .screen_saver import (
     DEFAULT_SCREEN_SAVER_FRAMES_PER_SECOND,
     DEFAULT_SCREEN_SAVER_IDLE_SECONDS,
-    screen_saver_frame,
-    screen_saver_is_active,
-    screen_saver_words_for_mode,
 )
 from .software_update import load_update_state, mark_update_display_ready, update_state_is_active
 from .spoken_navigation import SpokenNavigationFeedback
@@ -141,7 +150,7 @@ from .volume_controls import (
     restored_audible_volume_state,
     unmuted_volume,
 )
-from .wifi import SETUP_HOTSPOT_SSID, SETUP_HOTSPOT_URL, WifiStatus, wifi_status
+from .wifi import SETUP_HOTSPOT_SSID, WifiStatus, wifi_status
 
 
 DEFAULT_REFRESH_SECONDS = 0.14
@@ -149,38 +158,15 @@ DEFAULT_STATUS_REFRESH_SECONDS = 2.0
 DEFAULT_SPLASH_SECONDS = 0.5
 DEFAULT_STARTUP_NETWORK_GRACE_SECONDS = 30.0
 DEFAULT_HOME_REFRESH_SECONDS = 60.0
-DEFAULT_TITLE_SCROLL_DELAY_SECONDS = 2.0
-DEFAULT_TITLE_SCROLL_PX_PER_SECOND = 16.0
-DEFAULT_TITLE_SCROLL_LOOP_PAUSE_SECONDS = 2.0
-DEFAULT_VOLUME_OVERLAY_SECONDS = 3.0
-DEFAULT_IP_OVERLAY_SECONDS = 5.0
 DEFAULT_BOOT_SPLASH_HANDOFF_PATH = "/tmp/audiobookshelf-player-oled-starting"
 DEFAULT_BOOT_SPLASH_HANDOFF_SETTLE_SECONDS = 0.3
 DEFAULT_PLAYBACK_STATE_SAVE_SECONDS = 5.0
 DEFAULT_CONTROL_CLICK_MIN_INTERVAL_SECONDS = 0.045
 CONTROL_CLICK_OUTPUT_HOLD_SECONDS = 0.15
-DEFAULT_ACTIVE_BRIGHTNESS_PERCENT = 100
 DEFAULT_RUNTIME_CONFIG_REFRESH_SECONDS = 1.0
 DEFAULT_SOFTWARE_UPDATE_REFRESH_SECONDS = 0.2
-BOOK_LOADING_FRAME = TwoLineFrame("Opening book", "Press to cancel")
 BLUETOOTH_POWER_FRAME = TwoLineFrame("Bluetooth", "Updating...")
 SOFTWARE_UPDATE_FRAME = TwoLineFrame("UPDATING", "DO NOT POWER OFF")
-
-
-@dataclass(frozen=True)
-class BluetoothStatusResult:
-    enabled: bool
-    connected: bool
-
-
-def bluetooth_result_frame(result: BluetoothActionResult) -> DisplayFrame:
-    if result.success and result.connected is False:
-        return TwoLineFrame("Disconnected" if result.device_name else "Bluetooth off", "Internal speaker")
-    if result.success and result.device_name:
-        return TwoLineFrame("Speaker ready", result.device_name)
-    if result.success:
-        return TwoLineFrame("Bluetooth", "On" if result.enabled else "Off")
-    return TwoLineFrame("Bluetooth failed", result.message)
 
 
 class Shutdown:
@@ -218,39 +204,6 @@ def enable_stack_dump_signal() -> None:
         print(f"Stack dump signal could not be enabled: {error}")
 
 
-def frame_for_wifi_status(status: WifiStatus, lan_ip: str | None = None) -> DisplayFrame:
-    if status.connected and status.ssid == SETUP_HOTSPOT_SSID:
-        return setup_frame()
-
-    if status.connected:
-        return setup_address_frame(lan_ip)
-
-    return setup_frame()
-
-
-def splash_frame() -> SplashFrame:
-    return SplashFrame("chapter")
-
-
-def setup_frame() -> WifiSetupFrame:
-    return WifiSetupFrame(SETUP_HOTSPOT_SSID, SETUP_HOTSPOT_URL)
-
-
-def frame_for_boot_state(
-    status: WifiStatus | None,
-    home_frame: DisplayFrame | None = None,
-    lan_ip: str | None = None,
-    startup_waiting: bool = False,
-) -> DisplayFrame:
-    if home_frame is not None:
-        return home_frame
-    if status is None or (startup_waiting and not status.connected):
-        return splash_frame()
-    if not status.connected or status.ssid == SETUP_HOTSPOT_SSID:
-        return setup_frame()
-    return setup_address_frame(lan_ip)
-
-
 def load_home_frame(
     config: AppConfig | None = None,
     client_factory=AudiobookshelfClient,
@@ -267,26 +220,6 @@ def load_home_frame(
         return TwoLineFrame("Books unavailable", "Check setup")
 
 
-def bluetooth_status_result() -> BluetoothStatusResult:
-    enabled = bluetooth_powered()
-    connected = connected_bluetooth_audio_device() is not None if enabled else False
-    return BluetoothStatusResult(enabled=enabled, connected=connected)
-
-
-def start_bluetooth_status_worker(
-    results: queue.SimpleQueue[BluetoothStatusResult],
-    status_loader: Callable[[], BluetoothStatusResult] = bluetooth_status_result,
-) -> None:
-    def run() -> None:
-        try:
-            results.put(status_loader())
-        except Exception:
-            print("Bluetooth startup status worker failed:")
-            traceback.print_exc()
-
-    threading.Thread(target=run, daemon=True).start()
-
-
 def home_frame_for_books(books: list[Book]) -> DisplayFrame:
     if not books:
         return TwoLineFrame("No books", "Check library")
@@ -297,88 +230,6 @@ def home_frame_for_books(books: list[Book]) -> DisplayFrame:
         series_position=book.series_position,
         is_podcast=book_is_podcast(book),
     )
-
-
-def scrolled_home_frame(
-    frame: DisplayFrame,
-    elapsed_seconds: float,
-    delay_seconds: float = DEFAULT_TITLE_SCROLL_DELAY_SECONDS,
-    pixels_per_second: float = DEFAULT_TITLE_SCROLL_PX_PER_SECOND,
-    loop_pause_seconds: float = DEFAULT_TITLE_SCROLL_LOOP_PAUSE_SECONDS,
-) -> DisplayFrame:
-    if not isinstance(frame, HomeFrame) or elapsed_seconds < delay_seconds:
-        return frame
-    active_seconds = elapsed_seconds - delay_seconds
-    loop_pause_px = round(loop_pause_seconds * pixels_per_second)
-    raw_scroll_px = round(active_seconds * pixels_per_second)
-    if loop_pause_px and raw_scroll_px % loop_pause_px == 0:
-        scroll_px = raw_scroll_px
-    else:
-        scroll_px = raw_scroll_px
-    return HomeFrame(
-        title=frame.title,
-        author=frame.author,
-        series_position=frame.series_position,
-        title_scroll_px=scroll_px,
-        title_scrolling=True,
-        section_letter=frame.section_letter,
-        section_letter_fill=frame.section_letter_fill,
-        muted=frame.muted,
-        bluetooth_connected=frame.bluetooth_connected,
-        is_podcast=frame.is_podcast,
-    )
-
-
-def refresh_home_cache(
-    cached_home_frame: DisplayFrame | None,
-    next_home_frame: DisplayFrame,
-    home_frame_loaded_at: float,
-    now: float,
-) -> tuple[DisplayFrame, float]:
-    if same_home_cache_subject(cached_home_frame, next_home_frame):
-        return next_home_frame, home_frame_loaded_at
-    return next_home_frame, now
-
-
-def same_home_cache_subject(frame: DisplayFrame | None, next_frame: DisplayFrame) -> bool:
-    if isinstance(frame, HomeFrame) and isinstance(next_frame, HomeFrame):
-        return (
-            frame.title == next_frame.title
-            and frame.author == next_frame.author
-            and frame.series_position == next_frame.series_position
-            and frame.is_podcast == next_frame.is_podcast
-        )
-    return frame == next_frame
-
-
-def frame_with_mute_indicator(frame: DisplayFrame, muted: bool) -> DisplayFrame:
-    if not muted or isinstance(frame, VolumeFrame):
-        return frame
-    if hasattr(frame, "muted"):
-        return replace(frame, muted=True)
-    return frame
-
-
-def frame_with_status_indicators(
-    frame: DisplayFrame,
-    muted: bool,
-    bluetooth_connected: bool,
-) -> DisplayFrame:
-    if hasattr(frame, "bluetooth_connected"):
-        frame = replace(frame, bluetooth_connected=bluetooth_connected)
-    return frame_with_mute_indicator(frame, muted)
-
-
-def update_display_brightness(display, percent: int, current_percent: int) -> int:
-    percent = min(max(int(percent), 0), 100)
-    if percent == current_percent:
-        return current_percent
-    try:
-        display.set_brightness(percent)
-    except Exception as error:
-        print(f"OLED brightness update failed: {error}")
-        return current_percent
-    return percent
 
 
 def set_amp_shutdown(
@@ -656,49 +507,106 @@ def run_oled_service(
     shutdown = Shutdown()
     signal.signal(signal.SIGTERM, shutdown.request)
     signal.signal(signal.SIGINT, shutdown.request)
-    audio_test = AudioOutputTest()
-    progress_sync = ProgressSync()
-    listening_details = ListeningDetailsPublisher()
-    web_status = WebStatusPublisher(save_web_player_status)
-    web_commands = WebCommandInbox(consume_web_player_commands)
-    log_installed_build("OLED")
-    gst_runtime = GStreamerRuntime()
-    playback = PlaybackOwner(
-        GStreamerPlayback(progress_sync=progress_sync, runtime=gst_runtime), startup_reporter=record_startup_sample,
+    loop = OledServiceLoop(
+        display,
+        refresh_seconds=refresh_seconds,
+        screen_saver_idle_seconds=screen_saver_idle_seconds,
+        screen_saver_frames_per_second=screen_saver_frames_per_second,
+        startup_network_grace_seconds=startup_network_grace_seconds,
+        mixer_controls=mixer_controls,
+        software_volume_only=software_volume_only,
     )
-    spoken_navigation = SpokenNavigationFeedback(playback.set_spoken_navigation_ducked)
-    amp_shutdown: AmpShutdownPin | None = None
-    service_started_at = time.monotonic()
-    saved_output_volumes = None
-
-    menu = None
-    shelf = OledShelf()
-    dial_timing = DialTiming()
-    panel_off = False
-
-    def show(frame: DisplayFrame) -> None:
-        dial_timing.show(SCREEN_OFF if panel_off else frame, display.show)
-
     try:
-        while not shutdown.requested:
-            try:
-                startup_config = load_config()
-                break
-            except ConfigReadError:
-                display.show(TwoLineFrame("Settings unreadable", "Check config.json"))
-                sleep_until_shutdown(shutdown, 5.0)
-        else:
+        config = wait_for_startup_config(display, shutdown)
+        if config is None:
             return
-        panel_off = screen_off_due(startup_config, service_started_at, datetime.now(), service_started_at, None)
-        show(splash_frame())
+        loop.show_splash(config)
         sleep_until_shutdown(shutdown, splash_seconds)
+        loop.start_inputs(
+            nav_pins if nav_input_enabled else None, volume_pins if volume_input_enabled else None
+        )
+        loop.start_audio(amp_shutdown_pin)
+        loop.start_library(config, home_refresh_seconds)
+        loop.start_polling(status_refresh_seconds)
+        loop.run(shutdown)
+    finally:
+        loop.close()
 
-        events = OledInputQueue()
+
+def wait_for_startup_config(display: Sh1122Display, shutdown: Shutdown) -> AppConfig | None:
+    while not shutdown.requested:
+        try:
+            return load_config()
+        except ConfigReadError:
+            display.show(TwoLineFrame("Settings unreadable", "Check config.json"))
+            sleep_until_shutdown(shutdown, 5.0)
+    return None
+
+
+@dataclass
+class DialActions:
+    """Changes from draining the dial queue once, before web commands are applied."""
+
+    commands: list[MenuCommand]
+    overlay: DisplayFrame | None = None
+    changed: bool = False
+    pause: bool = False
+    resume: bool = False
+    unmuted_for_play: bool = False
+
+
+class OledServiceLoop:
+    def __init__(
+        self,
+        display: Sh1122Display,
+        *,
+        refresh_seconds: float,
+        screen_saver_idle_seconds: float,
+        screen_saver_frames_per_second: float,
+        startup_network_grace_seconds: float,
+        mixer_controls: tuple[str, ...],
+        software_volume_only: bool,
+    ) -> None:
+        self.refresh_seconds = refresh_seconds
+        self.startup_network_grace_seconds = startup_network_grace_seconds
+        self.mixer_controls = mixer_controls
+        self.software_volume_only = software_volume_only
+        self.audio_test = AudioOutputTest()
+        self.progress_sync = ProgressSync()
+        self.listening_details = ListeningDetailsPublisher()
+        self.web_status = WebStatusPublisher(save_web_player_status)
+        self.web_commands = WebCommandInbox(consume_web_player_commands)
+        log_installed_build("OLED")
+        self.gst_runtime = GStreamerRuntime()
+        self.playback = PlaybackOwner(
+            GStreamerPlayback(progress_sync=self.progress_sync, runtime=self.gst_runtime),
+            startup_reporter=record_startup_sample,
+        )
+        self.spoken_navigation = SpokenNavigationFeedback(
+            self.playback.set_spoken_navigation_ducked
+        )
+        self.amp_shutdown: AmpShutdownPin | None = None
+        self.started_at = time.monotonic()
+        self.saved_output_volumes: OutputVolumes | None = None
+        self.speakers: SpeakerPicker | None = None
+        self.shelf = OledShelf()
+        self.screen = OledPresentation(
+            display, self.started_at, screen_saver_idle_seconds, screen_saver_frames_per_second
+        )
+
+    def show_splash(self, config: AppConfig) -> None:
+        self.screen.panel_off = screen_off_due(
+            config, self.started_at, datetime.now(), self.started_at, None
+        )
+        self.screen.show(splash_frame())
+
+    def start_inputs(self, nav_pins: Ky040Pins | None, volume_pins: Ky040Pins | None) -> None:
+        self.events = OledInputQueue()
         # Keep the rotary inputs alive while they deliver GPIO callbacks.
-        _nav_input: NavigationRotaryInput | None = None
-        if nav_input_enabled:
+        self.nav_input: NavigationRotaryInput | None = None
+        if nav_pins is not None:
             try:
-                _nav_input = NavigationRotaryInput(events, nav=nav_pins)
+                self.nav_input = NavigationRotaryInput(self.events, nav=nav_pins)
                 print(
                     "Navigation rotary enabled on "
                     f"CLK GPIO{nav_pins.clk}, DT GPIO{nav_pins.dt}, SW GPIO{nav_pins.sw}, "
@@ -707,10 +615,10 @@ def run_oled_service(
             except Exception as error:
                 print(f"Navigation rotary could not start: {error}")
 
-        _volume_input: VolumeRotaryInput | None = None
-        if volume_input_enabled:
+        self.volume_input: VolumeRotaryInput | None = None
+        if volume_pins is not None:
             try:
-                _volume_input = VolumeRotaryInput(events, volume=volume_pins)
+                self.volume_input = VolumeRotaryInput(self.events, volume=volume_pins)
                 print(
                     "Volume rotary enabled on "
                     f"CLK GPIO{volume_pins.clk}, DT GPIO{volume_pins.dt}, SW GPIO{volume_pins.sw}"
@@ -718,770 +626,787 @@ def run_oled_service(
             except Exception as error:
                 print(f"Volume rotary could not start: {error}")
 
-        saved_volume = load_saved_volume() if software_volume_only else None
+    def start_audio(self, amp_shutdown_pin: int | None) -> None:
+        saved_volume = load_saved_volume() if self.software_volume_only else None
         if saved_volume is None:
-            previous_status = load_web_player_status() if software_volume_only else WebPlayerStatus()
+            previous_status = (
+                load_web_player_status() if self.software_volume_only else WebPlayerStatus()
+            )
             initial_volume = VolumeState(previous_status.volume_percent, previous_status.muted)
         else:
             initial_volume = saved_volume
-        software_volume = initial_volume.percent
-        software_muted = initial_volume.muted
-        volume_output = "speaker"
-        if software_volume_only:
-            saved_output_volumes = OutputVolumes(initial_volume, load_bluetooth_volume(initial_volume))
-            playback.configure_output_volumes(saved_output_volumes)
+        self.volume = initial_volume.percent
+        self.muted = initial_volume.muted
+        self.volume_output = "speaker"
+        if self.software_volume_only:
+            self.saved_output_volumes = OutputVolumes(
+                initial_volume, load_bluetooth_volume(initial_volume)
+            )
+            self.playback.configure_output_volumes(self.saved_output_volumes)
         else:
-            playback.set_volume_state(software_volume, software_muted)
-        control_click_feedback = ControlClickFeedback()
+            self.playback.set_volume_state(self.volume, self.muted)
+        self.control_click_feedback = ControlClickFeedback()
 
-        def announce_selection(selection: SpokenSelection) -> None:
-            spoken_navigation.request(
-                selection.text,
-                delay_seconds=selection.delay_seconds,
-                volume_percent=runtime_config.spoken_navigation_volume_percent,
-            )
-
-        def update_amp(*, feedback_active: bool = False) -> None:
-            nonlocal amp_shutdown
-            try:
-                set_amp_shutdown(
-                    amp_shutdown, software_muted, software_volume, feedback_active=feedback_active
-                )
-            except Exception as error:
-                amp_shutdown = None
-                print(f"MAX98357 amp shutdown control failed: {error}")
-
-        def play_click() -> None:
-            control_click_feedback.click(
-                runtime_config.control_click_volume_percent,
-                enable_output=lambda: update_amp(feedback_active=True),
-            )
-
-        if software_volume_only:
+        if self.software_volume_only:
             print("Software-only volume control enabled")
         if amp_shutdown_pin is not None:
             try:
-                amp_shutdown = AmpShutdownPin(amp_shutdown_pin)
-                set_amp_shutdown(amp_shutdown, muted=software_muted, volume_percent=software_volume)
+                self.amp_shutdown = AmpShutdownPin(amp_shutdown_pin)
+                set_amp_shutdown(self.amp_shutdown, muted=self.muted, volume_percent=self.volume)
                 print(f"MAX98357 amp shutdown enabled on GPIO{amp_shutdown_pin}")
             except Exception as error:
-                amp_shutdown = None
+                self.amp_shutdown = None
                 print(f"MAX98357 amp shutdown could not start: {error}")
 
-        runtime_config = startup_config
-        playback.set_playback_rate(startup_config.playback_speed)
-        catalogue_books = load_cached_books(startup_config)
-        menu = ApplianceMenu(
-            sorted_books_for_menu(books_with_downloads(startup_config, catalogue_books), startup_config.library_sort_mode),
-            library_sort_mode=startup_config.library_sort_mode,
+    def announce_selection(self, selection: SpokenSelection) -> None:
+        self.spoken_navigation.request(
+            selection.text,
+            delay_seconds=selection.delay_seconds,
+            volume_percent=self.config.spoken_navigation_volume_percent,
+        )
+
+    def update_amp(self, *, feedback_active: bool = False) -> None:
+        try:
+            set_amp_shutdown(
+                self.amp_shutdown, self.muted, self.volume, feedback_active=feedback_active
+            )
+        except Exception as error:
+            self.amp_shutdown = None
+            print(f"MAX98357 amp shutdown control failed: {error}")
+
+    def play_click(self) -> None:
+        self.control_click_feedback.click(
+            self.config.control_click_volume_percent,
+            enable_output=lambda: self.update_amp(feedback_active=True),
+        )
+
+    def start_library(self, config: AppConfig, home_refresh_seconds: float) -> None:
+        self.config = config
+        self.playback.set_playback_rate(config.playback_speed)
+        self.catalogue_books = load_cached_books(config)
+        self.menu = ApplianceMenu(
+            sorted_books_for_menu(
+                books_with_downloads(config, self.catalogue_books), config.library_sort_mode
+            ),
+            library_sort_mode=config.library_sort_mode,
             browsing=True,
         )
-        menu.set_bluetooth_enabled(False)
-        menu.set_bluetooth_connected(False)
+        self.speakers = self.menu.speakers
+        self.menu.set_bluetooth_enabled(False)
+        self.menu.set_bluetooth_connected(False)
         saved_playback = load_player_state()
-        if saved_playback and saved_playback.account and saved_playback.account != progress_account(startup_config):
+        if (
+            saved_playback
+            and saved_playback.account
+            and saved_playback.account != progress_account(config)
+        ):
             saved_playback = None
-        menu.set_startup_resume(saved_playback)
-        cached_home_frame: DisplayFrame | None = None
-        network_status = DeviceStatusCache(
-            None, WifiStatus(False, message="Wi-Fi status unavailable"),
-            ttl=status_refresh_seconds, name="chapter-oled-wifi",
+        self.menu.set_startup_resume(saved_playback)
+        self.catalogue = OledCatalogue(home_refresh_seconds)
+
+    def start_polling(self, status_refresh_seconds: float) -> None:
+        self.network_status = DeviceStatusCache(
+            None,
+            WifiStatus(False, message="Wi-Fi status unavailable"),
+            ttl=status_refresh_seconds,
+            name="chapter-oled-wifi",
         )
-        home_frame_loaded_at = 0.0
-        catalogue = OledCatalogue(home_refresh_seconds)
-        overlay_frame: DisplayFrame | None = None
-        displayed_opening_key = ""
-        overlay_until = 0.0
-        bluetooth_enabled = False
-        bluetooth_connected = False
-        bluetooth_used = False
-        bluetooth_results: queue.SimpleQueue[BluetoothActionResult] = queue.SimpleQueue()
-        bluetooth_status_results: queue.SimpleQueue[BluetoothStatusResult] = queue.SimpleQueue()
-        start_bluetooth_status_worker(bluetooth_status_results)
-        last_input_at = time.monotonic()
-        last_loop_at = last_input_at
-        last_runtime_config_load = last_input_at
-        last_software_update_load = 0.0
-        software_update_active = False
-        software_update_display_ready = False
-        software_update_screen_visible = False
-        sleep_timer = ListeningSleepTimer()
-        bedtime = BedtimeTimer()
-        sleep_gain = 1.0
-        night_volume_limit = 100
-        bookmark_requests: list[Future[bool]] = []
-        completed_session = None
-        bookmark_picker = OledBookmarkPicker()
-        last_knob_selection = 0.0
-        podcast_request: Future[list[Book]] | None = None
-        podcast_config: AppConfig | None = None
-        display_brightness_percent = DEFAULT_ACTIVE_BRIGHTNESS_PERCENT
-        screen_saver_visible = False
-        wake_input_quiet_until = 0.0
-        last_playback_volume_state = (software_volume, software_muted)
-        last_playback_state_save = 0.0
-        last_is_playing = playback.is_playing
-        first_menu_drawn = False
+        self.bluetooth = OledBluetooth()
+        start_bluetooth_status_worker(self.bluetooth.status_results)
+        self.screen.last_input_at = time.monotonic()
+        self.last_loop_at = self.screen.last_input_at
+        self.last_runtime_config_load = self.screen.last_input_at
+        self.last_software_update_load = 0.0
+        self.software_update_active = False
+        self.software_update_display_ready = False
+        self.software_update_screen_visible = False
+        self.sleep_timer = ListeningSleepTimer()
+        self.bedtime = BedtimeTimer()
+        self.sleep_gain = 1.0
+        self.night_volume_limit = 100
+        self.bookmark_requests: list[Future[bool]] = []
+        self.completed_session = None
+        self.bookmark_picker = OledBookmarkPicker()
+        self.last_knob_selection = 0.0
+        self.podcast_request: Future[list[Book]] | None = None
+        self.podcast_config: AppConfig | None = None
+        self.last_volume_state = (self.volume, self.muted)
+        self.last_playback_state_save = 0.0
+        self.last_is_playing = self.playback.is_playing
+        self.first_menu_drawn = False
+
+    def run(self, shutdown: Shutdown) -> None:
         while not shutdown.requested:
             try:
-                now = time.monotonic()
-                full_loop_elapsed = max(0.0, now - last_loop_at)
-                loop_elapsed = min(full_loop_elapsed, 1.0)
-                last_loop_at = now
-                local_time = datetime.now()
-                off_due = screen_off_due(runtime_config, now, local_time, service_started_at, events.last_dial_at)
-                woke_panel = panel_off and events.consume_panel_wake()
-                # A gesture already queued while the screen was lit still belongs to the menu.
-                panel_off = off_due and not woke_panel and (panel_off or events.empty())
-                if now - last_software_update_load >= DEFAULT_SOFTWARE_UPDATE_REFRESH_SECONDS:
-                    software_update_state = load_update_state()
-                    software_update_active = (
-                        software_update_state.phase == "installing" and update_state_is_active(software_update_state)
-                    )
-                    software_update_display_ready = software_update_state.display_ready
-                    last_software_update_load = now
-                if software_update_active:
-                    drain_input_events(events)
-                    spoken_navigation.cancel()
-                    screen_saver_visible = False
-                    display_brightness_percent = update_display_brightness(
-                        display,
-                        DEFAULT_ACTIVE_BRIGHTNESS_PERCENT,
-                        display_brightness_percent,
-                    )
-                    show(SOFTWARE_UPDATE_FRAME)
-                    if not software_update_screen_visible:
-                        software_update_screen_visible = True
-                        playback.cancel_book_request()
-                        pause_and_publish_playback(
-                            playback,
-                            menu,
-                            software_volume,
-                            software_muted,
-                            publisher=web_status,
-                        )
-                    if not software_update_display_ready:
-                        try:
-                            software_update_display_ready = mark_update_display_ready()
-                        except OSError as error:
-                            print(f"Software update display acknowledgement failed: {error}")
-                    sleep_until_shutdown(shutdown, refresh_seconds)
-                    continue
-                software_update_screen_visible = False
-                status = network_status.current(wifi_status)
-                if status is not None:
-                    menu.set_offline(not status.connected or status.ssid == SETUP_HOTSPOT_SSID)
-                refresh_due = now - last_runtime_config_load >= DEFAULT_RUNTIME_CONFIG_REFRESH_SECONDS
-                if refresh_due:
-                    refreshed_config = load_config()
-                    if refreshed_config.playback_speed != runtime_config.playback_speed:
-                        try:
-                            playback.set_playback_rate(refreshed_config.playback_speed)
-                        except PlaybackError as error:
-                            print(f"Playback speed update failed: {error}")
-                    account_changed = progress_account(refreshed_config) != progress_account(runtime_config)
-                    if account_changed or refreshed_config.library_id != runtime_config.library_id:
-                        catalogue_books = load_cached_books(refreshed_config)
-                        episodes = [] if account_changed else [book for book in menu.books if book.episode_id]
-                        menu.set_library_sort_mode(refreshed_config.library_sort_mode)
-                        menu.set_books(sorted_books_for_menu(
-                            books_with_downloads(refreshed_config, [*catalogue_books, *episodes]),
-                            refreshed_config.library_sort_mode,
-                        ))
-                    if catalogue_request_key(refreshed_config) != catalogue_request_key(runtime_config):
-                        catalogue.invalidate()
-                    runtime_config = refreshed_config
-                    last_runtime_config_load = now
-                shelf.apply_ready(runtime_config, catalogue_books, menu)
-                if refresh_due:
-                    shelf.request(runtime_config, catalogue_books, menu)
-                progress_sync.pump(runtime_config)
-                volume_snapshot = playback.state
-                output_changed = volume_snapshot.output_volumes is not None and volume_snapshot.volume_output != volume_output
-                if output_changed:
-                    volume_output = volume_snapshot.volume_output
-                    output_volume = volume_snapshot.output_volumes.for_output(volume_output)
-                    software_volume, software_muted = output_volume.percent, output_volume.muted
-                    last_playback_volume_state = (software_volume, software_muted)
-                menu.prefer_downloaded = runtime_config.prefer_downloaded
-                menu.skip_back_seconds = runtime_config.skip_back_seconds
-                menu.skip_forward_seconds = runtime_config.skip_forward_seconds
-                night = night_mode_active(
-                    runtime_config.night_mode, runtime_config.night_start, runtime_config.night_end, local_time
-                )
-                active_brightness = runtime_config.night_dim_percent if night else DEFAULT_ACTIVE_BRIGHTNESS_PERCENT
-                volume_limit = runtime_config.night_volume_limit if night else 100
-                if volume_limit != night_volume_limit:
-                    playback.set_night_volume_limit(volume_limit)
-                    night_volume_limit = volume_limit
-                if panel_off or woke_panel:
-                    woke_screen_saver, wake_input_quiet_until = False, 0.0
+                self.tick()
+                if self.software_update_active:
+                    sleep_until_shutdown(shutdown, self.refresh_seconds)
                 else:
-                    woke_screen_saver, wake_input_quiet_until = consume_screen_saver_wake_input(
-                        events, screen_saver_visible, now, wake_input_quiet_until,
+                    sleep_until_shutdown(
+                        shutdown, self.refresh_seconds, wake_on_input=self.events.wait_for_input
                     )
-                suppress_wake_input = panel_off or woke_screen_saver or now < wake_input_quiet_until
-                if woke_screen_saver or woke_panel:
-                    screen_saver_visible = False
-                    last_input_at = now
-                    if bedtime.sleeping:
-                        bedtime.cancel()
-                    if sleep_timer.wake():
-                        menu.dismiss_sleep_confirmation()
-                    display_brightness_percent = update_display_brightness(
-                        display,
-                        active_brightness,
-                        display_brightness_percent,
-                    )
-                if suppress_wake_input:
-                    overlay = None
-                    menu_changed = False
-                    commands = []
-                    pause_playback = False
-                    resume_playback = False
-                else:
-                    (
-                        overlay,
-                        software_volume,
-                        software_muted,
-                        menu_changed,
-                        commands,
-                        pause_playback,
-                        resume_playback,
-                    ) = handle_oled_input_events(
-                        events,
-                        menu,
-                        opening_key=displayed_opening_key,
-                        on_turn=dial_timing.observe,
-                        mixer_controls=mixer_controls,
-                        fallback_percent=software_volume,
-                        fallback_muted=software_muted,
-                        software_volume_only=software_volume_only,
-                        bluetooth_enabled=bluetooth_enabled,
-                        bluetooth_connected=bluetooth_connected,
-                        control_click_feedback=(
-                            play_click if runtime_config.control_click_enabled else None
-                        ),
-                        spoken_navigation_feedback=(
-                            announce_selection if runtime_config.spoken_navigation_enabled else None
-                        ),
-                        spoken_navigation_cancel=(
-                            spoken_navigation.cancel
-                            if runtime_config.spoken_navigation_enabled
-                            else None
-                        ),
-                    )
-                menu_changed = menu_changed or output_changed
-                commands, software_volume, software_muted, unmuted_for_play, resume_from_muted_play = (
-                    unmute_for_audible_playback_commands(
-                        commands,
-                        software_volume,
-                        software_muted,
-                        mixer_controls=mixer_controls,
-                        software_volume_only=software_volume_only,
-                    )
-                )
-                if unmuted_for_play:
-                    resume_playback = resume_playback or resume_from_muted_play
-                    menu_changed = True
-                bluetooth_used = bluetooth_used or menu.speakers.active or any(
-                    command.type == CommandType.SET_BLUETOOTH_ENABLED for command in commands
-                )
-                while True:
-                    try:
-                        bluetooth_status = bluetooth_status_results.get_nowait()
-                    except queue.Empty:
-                        break
-                    if bluetooth_used:
-                        continue  # A startup probe can finish after the listener has changed the adapter.
-                    bluetooth_enabled = bluetooth_status.enabled
-                    bluetooth_connected = bluetooth_status.connected
-                    menu.set_bluetooth_enabled(bluetooth_enabled)
-                    menu.set_bluetooth_connected(bluetooth_connected)
-                    playback.set_bluetooth_output_enabled(bluetooth_connected)
-                    playback.refresh_audio_output()
-                    menu_changed = True
-                if menu.screen == Screen.BLUETOOTH_DEVICES:
-                    speaker_result = menu.speakers.poll()
-                    if menu.speakers.powered:
-                        bluetooth_enabled = True
-                        menu.set_bluetooth_enabled(True)
-                    if speaker_result is not None:
-                        bluetooth_results.put(speaker_result)
-                elif menu.speakers.active:
-                    menu.speakers.close()
-                while True:
-                    try:
-                        bluetooth_result = bluetooth_results.get_nowait()
-                    except queue.Empty:
-                        break
-                    bluetooth_enabled = bluetooth_result.enabled if bluetooth_result.enabled is not None else bluetooth_enabled
-                    if bluetooth_result.connected is not None:
-                        bluetooth_connected = bluetooth_result.connected
-                    elif bluetooth_result.enabled is False:
-                        bluetooth_connected = False
-                    menu.set_bluetooth_enabled(bluetooth_enabled)
-                    menu.set_bluetooth_connected(bluetooth_connected)
-                    if bluetooth_result.success:
-                        if bluetooth_result.device_address and bluetooth_result.connected:
-                            audio_test.bluetooth_address = bluetooth_result.device_address
-                            playback.set_bluetooth_output_enabled(True, bluetooth_result.device_address)
-                        else:
-                            if not bluetooth_connected:
-                                audio_test.bluetooth_address = ""
-                            playback.set_bluetooth_output_enabled(bluetooth_connected)
-                        playback.refresh_audio_output()
-                    menu_changed = True
-                    if bluetooth_result.device_address and menu.screen == Screen.BLUETOOTH_DEVICES:
-                        menu.close_bluetooth_menu()
-                    overlay = bluetooth_result_frame(bluetooth_result)
-                playback_volume_state = (software_volume, software_muted)
-                if playback_volume_state != last_playback_volume_state and not resume_playback:
-                    playback.set_volume_state(
-                        software_volume, software_muted, output=volume_output if software_volume_only else None,
-                    )
-                    if not pause_playback:
-                        web_status.publish(playback, software_volume, software_muted)
-                    last_playback_volume_state = playback_volume_state
-                update_amp(
-                    feedback_active=control_click_feedback.needs_audio_output
-                    or (
-                        runtime_config.spoken_navigation_enabled
-                        and spoken_navigation.needs_audio_output
-                    )
-                )
-                input_activity = input_activity_seen(
-                    overlay,
-                    menu_changed,
-                    commands,
-                    pause_playback or resume_playback,
-                )
-                if input_activity:
-                    last_input_at = now
-                    menu.note_input_activity()
-                    if sleep_timer.wake():
-                        menu.dismiss_sleep_confirmation()
-                        menu_changed = True
-                    display_brightness_percent = update_display_brightness(
-                        display,
-                        active_brightness,
-                        display_brightness_percent,
-                    )
-                menu.tick_section_letter(loop_elapsed)
-                if pause_playback and not resume_playback:
-                    playback.pause_for_mute()
-                    menu.update_playback(playback.current_time, False)
-                    web_status.publish(playback, software_volume, software_muted)
-                    menu_changed = True
-                elif resume_playback:
-                    playback.resume_after_mute(software_volume, software_muted)
-                    web_status.publish(playback, software_volume, software_muted)
-                    last_playback_volume_state = playback_volume_state
-                elif unmuted_for_play:
-                    playback.clear_mute_pause()
-                if menu_changed:
-                    overlay_frame = None
-                    cached_home_frame = None
-                    home_frame_loaded_at = now
-                for command in commands:
-                    if command.type == CommandType.PLAY_BOOK:
-                        input_age = max(0.0, time.monotonic() - command.selected_at) if command.selected_at is not None else 0
-                        last_knob_selection = time.time() - input_age
-                    if command.type == CommandType.RETRY_LIBRARY:
-                        catalogue.refresh_when_online()
-                        menu.library_error = None
-                        continue
-                    if command.type == CommandType.CONFIRM_STILL_LISTENING:
-                        sleep_timer.confirm()
-                    if command.type == CommandType.SET_BEDTIME:
-                        overlay = arm_bedtime(bedtime, command.timer_minutes, now, menu, runtime_config.sleep_rewind)
-                        playback.set_sleep_boundary(bedtime.chapter_end)
-                        continue
-                    if command.type == CommandType.LOAD_PODCASTS:
-                        if podcast_request is None:
-                            podcast_config = runtime_config
-                            podcast_request = request_podcast_catalogue(podcast_config)
-                        overlay = TwoLineFrame("Loading podcasts", "Please wait")
-                        continue
-                    if command.type == CommandType.LOAD_BOOKMARKS:
-                        if bookmark_picker.open(runtime_config, menu):
-                            overlay_frame = None
-                            menu_changed = True
-                        continue
-                    if command.type == CommandType.SAVE_BOOKMARK:
-                        bookmark_requests.append(playback.save_bookmark())
-                        overlay = TwoLineFrame("Saving bookmark", "Audiobookshelf")
-                        continue
-                    command_overlay = handle_menu_command(command, menu, playback, bluetooth_results)
-                    if command.type in (
-                        CommandType.PAUSE_PLAYBACK,
-                        CommandType.END_SELECTION,
-                        CommandType.TOGGLE_PLAYBACK,
-                        CommandType.SEEK_CHAPTER,
-                        CommandType.HOME,
-                        CommandType.CONFIRM_STILL_LISTENING,
-                    ):
-                        web_status.publish(playback, software_volume, software_muted)
-                    menu_changed = True
-                    cached_home_frame = None
-                    home_frame_loaded_at = now
-                    if command_overlay is not None:
-                        overlay = command_overlay
-                catalogue_requests: list[WebPlayerCommand] = []
-
-                def request_web_book(web_command: WebPlayerCommand) -> None:
-                    nonlocal overlay, menu_changed
-                    replacement = handle_web_book_request(web_command, last_knob_selection, menu, playback)
-                    if replacement is not None:
-                        overlay = replacement
-                    menu_changed = True
-
-                def set_web_sleep_timer(minutes: int) -> None:
-                    nonlocal overlay
-                    overlay = arm_bedtime(bedtime, minutes, now, menu, runtime_config.sleep_rewind)
-                    playback.set_sleep_boundary(bedtime.chapter_end)
-
-                web_volume, web_muted, web_changed, web_refresh_library = handle_web_player_commands(
-                    playback,
-                    menu,
-                    software_volume,
-                    software_muted,
-                    commands=web_commands.read(),
-                    request_catalogue=catalogue_requests.append,
-                    audio_test=audio_test,
-                    night_volume_limit=night_volume_limit,
-                    request_book=request_web_book,
-                    listening_control=lambda command: apply_listening_control(
-                        command, playback, menu, runtime_config, set_web_sleep_timer,
-                    ),
-                )
-                if web_changed:
-                    software_volume = web_volume
-                    software_muted = web_muted
-                    last_playback_volume_state = (software_volume, software_muted)
-                    menu_changed = True
-                    cached_home_frame = None
-                    home_frame_loaded_at = now
-                    if playback.is_playing and bedtime.sleeping:
-                        bedtime.cancel()
-                    if playback.is_playing and (sleep_timer.prompt_active or sleep_timer.sleeping):
-                        sleep_timer.confirm()
-                        menu.dismiss_sleep_confirmation()
-                        last_input_at = now
-                        display_brightness_percent = update_display_brightness(
-                            display,
-                            active_brightness,
-                            display_brightness_percent,
-                        )
-                output_volumes = playback.state.output_volumes
-                if output_volumes is not None and output_volumes != saved_output_volumes:
-                    try:
-                        save_output_volumes(output_volumes)
-                        saved_output_volumes = output_volumes
-                    except OSError as error:
-                        print(f"Could not save playback volume: {error}")
-                if web_refresh_library:
-                    catalogue.invalidate()
-                if catalogue_requests:
-                    catalogue.request_latest(catalogue_requests, load_config(), now)
-                refreshed = catalogue.poll()
-                if refreshed:
-                    book_result, effective_config = refreshed
-                    if book_result.books is not None and book_result.library is not None:
-                        runtime_config = apply_library_choice(
-                            runtime_config, effective_config.library_id, effective_config.library_name
-                        )
-                    cached_home_frame = None
-                    home_frame_loaded_at = now
-                    if book_result.books is not None:
-                        catalogue_books = book_result.books
-                        menu.set_library_sort_mode(effective_config.library_sort_mode)
-                        menu.set_books(sorted_books_for_menu(
-                            books_with_downloads(effective_config, [
-                                *catalogue_books, *(book for book in menu.books if book.episode_id)
-                            ]), effective_config.library_sort_mode,
-                        ))
-                    elif book_result.error_frame is not None and not menu.books:
-                        menu.library_error = book_result.error_frame
-                playback_result = playback.advance_book_request()
-                if not playback.loading_book:
-                    if overlay_frame == BOOK_LOADING_FRAME:
-                        overlay_frame = None
-                    if overlay == BOOK_LOADING_FRAME:
-                        overlay = None
-                if playback_result is not None:
-                    overlay_frame = None
-                    cached_home_frame = None
-                    home_frame_loaded_at = now
-                    if playback_result.error_frame is not None:
-                        overlay = playback_result.error_frame
-                    elif playback_result.session is not None:
-                        menu.set_session(playback_result.session, is_playing=playback.is_playing, session_key=playback.state.session_key)
-                        remove_started_book(runtime_config, playback_result.session)
-                        save_playback_state(playback)
-                        last_playback_state_save = now
-                        web_status.publish(playback, software_volume, software_muted)
-                if bookmark_picker.apply_ready(runtime_config, menu):
-                    menu_changed = True
-                for request in bookmark_requests[:]:
-                    if request.done():
-                        bookmark_requests.remove(request)
-                        overlay = (
-                            TwoLineFrame("Bookmark saved", "Audiobookshelf")
-                            if request.result()
-                            else TwoLineFrame("Bookmark failed", "Check connection")
-                        )
-                if podcast_request and podcast_request.done():
-                    finished_request = podcast_request
-                    podcast_request = None
-                    if podcast_config and (
-                        progress_account(podcast_config) == progress_account(runtime_config)
-                        and podcast_config.podcasts == runtime_config.podcasts
-                    ):
-                        try:
-                            episodes = finished_request.result()
-                        except Exception as error:
-                            print(f"Podcast catalogue request failed: {type(error).__name__}")
-                            overlay = TwoLineFrame("Podcasts unavailable", "Open Podcasts to retry")
-                        else:
-                            menu.set_books([*(book for book in menu.books if not book.episode_id), *episodes])
-                            overlay = None if episodes else TwoLineFrame("No episodes", "Check podcast library")
-                            overlay_frame = None
-                if runtime_config.spoken_navigation_enabled:
-                    speech_output_device = playback.state.audio_output_device
-                    if (
-                        bluetooth_connected
-                        and not speech_output_device
-                        and spoken_navigation.ready_to_start
-                    ):
-                        speech_output_device = preferred_bluetooth_alsa_device(audio_test.bluetooth_address)
-                    spoken_navigation.poll(speech_output_device)
-                else:
-                    spoken_navigation.cancel()
-                if playback.loading_book and playback.state.completed_session is not None:
-                    completed_session = playback.state.completed_session
-                if not playback.loading_book:
-                    playback_error_frame = poll_playback_safely(playback)
-                    if playback_error_frame is not None:
-                        overlay = playback_error_frame
-                        menu_changed = True
-                        cached_home_frame = None
-                        home_frame_loaded_at = now
-                    finished = playback.state.completed_session
-                    if finished is not None and finished is not completed_session:
-                        completed_session = finished
-                        can_advance = not software_muted and not bedtime.sleeping and (
-                            bedtime.deadline is None or now < bedtime.deadline
-                        )
-                        next_book = finish_naturally(menu, runtime_config, finished, can_advance=can_advance)
-                        if next_book is not None:
-                            overlay = handle_play_book_command(MenuCommand(
-                                CommandType.PLAY_BOOK, book_id=next_book.id,
-                                resume_time=next_book.current_time,
-                            ), menu, playback)
-                        menu_changed = True
-                        cached_home_frame = None
-                    if playback.session is not None:
-                        menu.update_playback(playback.current_time, playback.is_playing)
-                        if now - last_playback_state_save >= DEFAULT_PLAYBACK_STATE_SAVE_SECONDS:
-                            save_playback_state(playback)
-                            last_playback_state_save = now
-                        menu.update_title_scroll(
-                            loop_elapsed,
-                            delay_seconds=DEFAULT_TITLE_SCROLL_DELAY_SECONDS,
-                            pixels_per_second=DEFAULT_TITLE_SCROLL_PX_PER_SECOND,
-                        )
-                        if menu.tick_chapter_confirm_timeout(loop_elapsed):
-                            cached_home_frame = None
-                            home_frame_loaded_at = now
-                        if menu.tick_home_return_timeout(loop_elapsed):
-                            cached_home_frame = None
-                            home_frame_loaded_at = now
-                if overlay is not None:
-                    overlay_frame = overlay
-                    overlay_seconds = (
-                        60.0
-                        if overlay == BOOK_LOADING_FRAME
-                        else DEFAULT_IP_OVERLAY_SECONDS
-                        if isinstance(overlay, TwoLineFrame)
-                        else DEFAULT_VOLUME_OVERLAY_SECONDS
-                    )
-                    overlay_until = now + overlay_seconds
-                if playback.loading_book and overlay_frame is None:
-                    overlay_frame = BOOK_LOADING_FRAME
-                    overlay_until = now + 60.0
-
-                session_id = ""
-                if (session := playback.session) is not None:
-                    session_id = session.id or session.library_item_id
-                sleep_update = bedtime.update(
-                    session_id=session_id, now=now, position=playback.current_time,
-                    speed=playback.state.playback_rate, playing=playback.is_playing,
-                )
-                listening_details.publish(playback.state, menu.undo_position, bedtime, menu.selected_series)
-                if abs(sleep_update.gain - sleep_gain) > 0.001:
-                    playback.set_sleep_gain(sleep_update.gain)
-                    sleep_gain = sleep_update.gain
-                if sleep_update.pause:
-                    playback.sleep_at_position(sleep_update.rewind_to)
-                    save_playback_state(playback)
-                    last_playback_state_save = now
-                    menu.update_playback(playback.current_time, False)
-                    sleep_timer.confirm()
-                    overlay_frame = None
-                    overlay_until = 0.0
-                sleep_event = sleep_timer.update(
-                    now=now,
-                    elapsed_seconds=full_loop_elapsed,
-                    enabled=runtime_config.sleep_timer_enabled and not bedtime.session_id,
-                    minutes=runtime_config.sleep_timer_minutes,
-                    session_id=session_id,
-                    is_playing=playback.is_playing,
-                )
-                apply_sleep_timer_event(
-                    sleep_event,
-                    sleep_timer,
-                    now,
-                    playback,
-                    menu,
-                    software_volume,
-                    software_muted,
-                    publisher=web_status,
-                )
-                if sleep_event == "prompt":
-                    overlay_frame = None
-                    overlay_until = 0.0
-                    last_input_at = now
-                if sleep_event:
-                    menu_changed = True
-                state = playback.state
-                if state.is_playing != last_is_playing:
-                    last_is_playing = state.is_playing
-                    menu.update_playback(state.current_time, state.is_playing)
-                    web_status.publish(playback, software_volume, software_muted)
-
-                startup_waiting = now - service_started_at < startup_network_grace_seconds
-
-                if overlay_frame is not None and now < overlay_until:
-                    visible_overlay = overlay_frame
-                    display_brightness_percent = update_display_brightness(
-                        display,
-                        active_brightness,
-                        display_brightness_percent,
-                    )
-                    screen_saver_visible = False
-                    show(
-                        frame_with_status_indicators(
-                            visible_overlay,
-                            software_muted or software_volume <= 0,
-                            bluetooth_connected,
-                        )
-                    )
-                    displayed_opening_key = playback.opening_key if visible_overlay == BOOK_LOADING_FRAME else ""
-                    web_status.publish(playback, software_volume, software_muted, display_drawn=True)
-                    sleep_until_shutdown(shutdown, refresh_seconds, wake_on_input=events.wait_for_input)
-                    continue
-                overlay_frame = None
-                displayed_opening_key = ""
-
-                if status is not None and status.connected and status.ssid != SETUP_HOTSPOT_SSID:
-                    loading_config = catalogue.start_if_due(now)
-                    if loading_config is not None:
-                        menu.set_library_sort_mode(loading_config.library_sort_mode)
-                    next_home_frame = menu.render()
-                    if menu.screen == Screen.LIBRARY and not menu.books:
-                        if not runtime_config.is_ready:
-                            next_home_frame = setup_address_frame()
-                        elif catalogue.in_progress:
-                            next_home_frame = TwoLineFrame("Loading books", "Connecting...")
-                    cached_home_frame, home_frame_loaded_at = refresh_home_cache(
-                        cached_home_frame,
-                        next_home_frame,
-                        home_frame_loaded_at,
-                        now,
-                    )
-                    home_frame = scrolled_home_frame(cached_home_frame, now - home_frame_loaded_at)
-                    frame = frame_for_boot_state(status, home_frame, startup_waiting=startup_waiting)
-                else:
-                    catalogue.refresh_when_online()
-                    cached_home_frame = None
-                    frame = frame_for_boot_state(
-                        status,
-                        menu.render() if menu.books or menu.screen in (Screen.BLUETOOTH, Screen.BLUETOOTH_DEVICES) else None,
-                        startup_waiting=startup_waiting,
-                    )
-                menu_ready = not isinstance(frame, SplashFrame)
-                normal_screen_saver_active = screen_saver_is_active(
-                    now,
-                    last_input_at,
-                    screen_saver_idle_seconds,
-                ) and not sleep_timer.prompt_active
-                screen_saver_active = not panel_off and (bedtime.sleeping or sleep_timer.sleeping or normal_screen_saver_active)
-                if screen_saver_active:
-                    screen_saver_mode = runtime_config.screen_saver_mode
-                    screen_saver_started_at = (
-                        bedtime.sleep_started_at or sleep_timer.sleep_started_at or last_input_at
-                    )
-                    frame = screen_saver_frame(
-                        now,
-                        screen_saver_started_at,
-                        screen_saver_frames_per_second,
-                        mode=screen_saver_mode,
-                        words=screen_saver_words_for_mode(screen_saver_mode, menu.books),
-                        brightness_percent=runtime_config.screen_saver_dim_percent,
-                        clock_format=runtime_config.screen_saver_clock_format,
-                    )
-                brightness = (
-                    min(screen_saver_contrast_percent(frame.brightness_percent), active_brightness)
-                    if isinstance(frame, ScreenSaverFrame)
-                    else active_brightness
-                )
-                display_brightness_percent = update_display_brightness(
-                    display,
-                    brightness,
-                    display_brightness_percent,
-                )
-                screen_saver_visible = screen_saver_active
-                show(
-                    frame_with_status_indicators(
-                        frame,
-                        software_muted or software_volume <= 0,
-                        bluetooth_connected,
-                    )
-                )
-                if menu_ready and not first_menu_drawn:
-                    first_menu_drawn = True
-                    gst_runtime.start_warmup()
-                    if not effective_muted(software_volume, software_muted):
-                        play_boot_chime(min(software_volume, night_volume_limit))
-                web_status.publish(playback, software_volume, software_muted, display_drawn=True)
-                sleep_until_shutdown(shutdown, refresh_seconds, wake_on_input=events.wait_for_input)
             except ConfigReadError:
-                show(TwoLineFrame("Settings unreadable", "Check config.json"))
+                self.screen.show(TwoLineFrame("Settings unreadable", "Check config.json"))
                 sleep_until_shutdown(shutdown, 5.0)
             except Exception:
                 print("OLED service loop error:")
                 traceback.print_exc()
                 try:
-                    screen_saver_visible = False
-                    show(TwoLineFrame("OLED error", "See log"))
+                    self.screen.saver_visible = False
+                    self.screen.show(TwoLineFrame("OLED error", "See log"))
                 except Exception:
                     print("OLED error frame could not be displayed:")
                     traceback.print_exc()
                 sleep_until_shutdown(shutdown, 5.0)
-    finally:
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        elapsed = max(0.0, now - self.last_loop_at)
+        menu_elapsed = min(elapsed, 1.0)
+        self.last_loop_at = now
+        local_time = datetime.now()
+        woke_panel = self.screen.update_panel_power(self.config, self.events, now, local_time)
+        if self.show_update_if_active(now):
+            return
+
+        status = self.network_status.current(wifi_status)
+        if status is not None:
+            self.menu.set_offline(not status.connected or status.ssid == SETUP_HOTSPOT_SSID)
+        self.refresh_settings_and_shelf(now)
+        self.progress_sync.pump(self.config)
+        output_changed = self.sync_output_volume()
+        brightness = self.apply_listening_preferences(local_time)
+        overlay = self.handle_dials(now, menu_elapsed, woke_panel, brightness, output_changed)
+        overlay = self.run_web_commands(overlay, now, brightness)
+        self.poll_catalogue(now)
+        overlay = self.advance_book_request(overlay, now)
+        overlay = self.poll_bookmarks(overlay)
+        overlay = self.poll_podcasts(overlay)
+        self.poll_spoken_navigation()
+        overlay = self.poll_playback(overlay, now, menu_elapsed)
+        self.screen.update_overlay(overlay, now, loading=self.playback.loading_book)
+        self.update_sleep_timers(now, elapsed)
+        self.publish_playback_transition()
+        self.draw_frame(status, now, brightness)
+
+    def show_update_if_active(self, now: float) -> bool:
+        if now - self.last_software_update_load >= DEFAULT_SOFTWARE_UPDATE_REFRESH_SECONDS:
+            software_update_state = load_update_state()
+            self.software_update_active = (
+                software_update_state.phase == "installing"
+                and update_state_is_active(software_update_state)
+            )
+            self.software_update_display_ready = software_update_state.display_ready
+            self.last_software_update_load = now
+        if not self.software_update_active:
+            self.software_update_screen_visible = False
+            return False
+        drain_input_events(self.events)
+        self.spoken_navigation.cancel()
+        self.screen.saver_visible = False
+        self.screen.set_brightness(DEFAULT_ACTIVE_BRIGHTNESS_PERCENT)
+        self.screen.show(SOFTWARE_UPDATE_FRAME)
+        if not self.software_update_screen_visible:
+            self.software_update_screen_visible = True
+            self.playback.cancel_book_request()
+            pause_and_publish_playback(
+                self.playback,
+                self.menu,
+                self.volume,
+                self.muted,
+                publisher=self.web_status,
+            )
+        if not self.software_update_display_ready:
+            try:
+                self.software_update_display_ready = mark_update_display_ready()
+            except OSError as error:
+                print(f"Software update display acknowledgement failed: {error}")
+        return True
+
+    def refresh_settings_and_shelf(self, now: float) -> None:
+        refresh_due = now - self.last_runtime_config_load >= DEFAULT_RUNTIME_CONFIG_REFRESH_SECONDS
+        if refresh_due:
+            refreshed_config = load_config()
+            if refreshed_config.playback_speed != self.config.playback_speed:
+                try:
+                    self.playback.set_playback_rate(refreshed_config.playback_speed)
+                except PlaybackError as error:
+                    print(f"Playback speed update failed: {error}")
+            account_changed = progress_account(refreshed_config) != progress_account(self.config)
+            if account_changed or refreshed_config.library_id != self.config.library_id:
+                self.catalogue_books = load_cached_books(refreshed_config)
+                episodes = (
+                    [] if account_changed else [book for book in self.menu.books if book.episode_id]
+                )
+                self.menu.set_library_sort_mode(refreshed_config.library_sort_mode)
+                self.menu.set_books(
+                    sorted_books_for_menu(
+                        books_with_downloads(refreshed_config, [*self.catalogue_books, *episodes]),
+                        refreshed_config.library_sort_mode,
+                    )
+                )
+            if catalogue_request_key(refreshed_config) != catalogue_request_key(self.config):
+                self.catalogue.invalidate()
+            self.config = refreshed_config
+            self.last_runtime_config_load = now
+        self.shelf.apply_ready(self.config, self.catalogue_books, self.menu)
+        if refresh_due:
+            self.shelf.request(self.config, self.catalogue_books, self.menu)
+
+    def sync_output_volume(self) -> bool:
+        volume_snapshot = self.playback.state
+        output_changed = (
+            volume_snapshot.output_volumes is not None
+            and volume_snapshot.volume_output != self.volume_output
+        )
+        if output_changed:
+            self.volume_output = volume_snapshot.volume_output
+            output_volume = volume_snapshot.output_volumes.for_output(self.volume_output)
+            self.volume, self.muted = output_volume.percent, output_volume.muted
+            self.last_volume_state = (self.volume, self.muted)
+        return output_changed
+
+    def apply_listening_preferences(self, local_time: datetime) -> int:
+        self.menu.prefer_downloaded = self.config.prefer_downloaded
+        self.menu.skip_back_seconds = self.config.skip_back_seconds
+        self.menu.skip_forward_seconds = self.config.skip_forward_seconds
+        night = night_mode_active(
+            self.config.night_mode, self.config.night_start, self.config.night_end, local_time
+        )
+        active_brightness = (
+            self.config.night_dim_percent if night else DEFAULT_ACTIVE_BRIGHTNESS_PERCENT
+        )
+        volume_limit = self.config.night_volume_limit if night else 100
+        if volume_limit != self.night_volume_limit:
+            self.playback.set_night_volume_limit(volume_limit)
+            self.night_volume_limit = volume_limit
+        return active_brightness
+
+    def handle_dials(
+        self,
+        now: float,
+        menu_elapsed: float,
+        woke_panel: bool,
+        brightness: int,
+        output_changed: bool,
+    ) -> DisplayFrame | None:
+        if self.consume_wake_gesture(now, woke_panel, brightness):
+            actions = DialActions([])
+        else:
+            actions = self.read_dials()
+        actions.changed |= output_changed
+        self.poll_bluetooth(actions)
+        self.apply_dial_volume(actions)
+        self.note_dial_activity(actions, now, brightness)
+        self.menu.tick_section_letter(menu_elapsed)
+        self.apply_mute_transport(actions)
+        if actions.changed:
+            self.screen.overlay = None
+            self.screen.invalidate_home(now)
+        return self.run_menu_commands(actions.commands, actions.overlay, now)
+
+    def consume_wake_gesture(self, now: float, woke_panel: bool, brightness: int) -> bool:
+        woke_saver = self.screen.consume_saver_wake(self.events, now, woke_panel)
+        suppress_input = self.screen.panel_off or woke_saver or now < self.screen.wake_quiet_until
+        if woke_saver or woke_panel:
+            self.screen.saver_visible = False
+            self.screen.last_input_at = now
+            if self.bedtime.sleeping:
+                self.bedtime.cancel()
+            if self.sleep_timer.wake():
+                self.menu.dismiss_sleep_confirmation()
+            self.screen.set_brightness(brightness)
+        return suppress_input
+
+    def read_dials(self) -> DialActions:
+        (
+            overlay,
+            self.volume,
+            self.muted,
+            menu_changed,
+            commands,
+            pause_playback,
+            resume_playback,
+        ) = handle_oled_input_events(
+            self.events,
+            self.menu,
+            opening_key=self.screen.opening_key,
+            on_turn=self.screen.timing.observe,
+            mixer_controls=self.mixer_controls,
+            fallback_percent=self.volume,
+            fallback_muted=self.muted,
+            software_volume_only=self.software_volume_only,
+            bluetooth_enabled=self.bluetooth.enabled,
+            bluetooth_connected=self.bluetooth.connected,
+            control_click_feedback=(self.play_click if self.config.control_click_enabled else None),
+            spoken_navigation_feedback=(
+                self.announce_selection if self.config.spoken_navigation_enabled else None
+            ),
+            spoken_navigation_cancel=(
+                self.spoken_navigation.cancel if self.config.spoken_navigation_enabled else None
+            ),
+        )
+        commands, self.volume, self.muted, unmuted_for_play, resume_from_muted_play = (
+            unmute_for_audible_playback_commands(
+                commands,
+                self.volume,
+                self.muted,
+                mixer_controls=self.mixer_controls,
+                software_volume_only=self.software_volume_only,
+            )
+        )
+        if unmuted_for_play:
+            resume_playback = resume_playback or resume_from_muted_play
+            menu_changed = True
+        return DialActions(
+            commands,
+            overlay=overlay,
+            changed=menu_changed,
+            pause=pause_playback,
+            resume=resume_playback,
+            unmuted_for_play=unmuted_for_play,
+        )
+
+    def poll_bluetooth(self, actions: DialActions) -> None:
+        actions.changed |= self.bluetooth.apply_startup_status(
+            self.menu, self.playback, actions.commands
+        )
+        self.bluetooth.poll_picker(self.menu)
+        overlay = self.bluetooth.apply_actions(self.menu, self.playback, self.audio_test)
+        if overlay is not None:
+            actions.overlay = overlay
+            actions.changed = True
+
+    def apply_dial_volume(self, actions: DialActions) -> None:
+        playback_volume_state = (self.volume, self.muted)
+        if playback_volume_state != self.last_volume_state and not actions.resume:
+            self.playback.set_volume_state(
+                self.volume,
+                self.muted,
+                output=self.volume_output if self.software_volume_only else None,
+            )
+            if not actions.pause:
+                self.web_status.publish(self.playback, self.volume, self.muted)
+            self.last_volume_state = playback_volume_state
+        self.update_amp(
+            feedback_active=self.control_click_feedback.needs_audio_output
+            or (self.config.spoken_navigation_enabled and self.spoken_navigation.needs_audio_output)
+        )
+
+    def note_dial_activity(self, actions: DialActions, now: float, brightness: int) -> None:
+        input_activity = input_activity_seen(
+            actions.overlay,
+            actions.changed,
+            actions.commands,
+            actions.pause or actions.resume,
+        )
+        if input_activity:
+            self.screen.last_input_at = now
+            self.menu.note_input_activity()
+            if self.sleep_timer.wake():
+                self.menu.dismiss_sleep_confirmation()
+                actions.changed = True
+            self.screen.set_brightness(brightness)
+
+    def apply_mute_transport(self, actions: DialActions) -> None:
+        if actions.pause and not actions.resume:
+            self.playback.pause_for_mute()
+            self.menu.update_playback(self.playback.current_time, False)
+            self.web_status.publish(self.playback, self.volume, self.muted)
+            actions.changed = True
+        elif actions.resume:
+            self.playback.resume_after_mute(self.volume, self.muted)
+            self.web_status.publish(self.playback, self.volume, self.muted)
+            self.last_volume_state = (self.volume, self.muted)
+        elif actions.unmuted_for_play:
+            self.playback.clear_mute_pause()
+
+    def run_menu_commands(
+        self,
+        commands: list[MenuCommand],
+        overlay: DisplayFrame | None,
+        now: float,
+    ) -> DisplayFrame | None:
+        for command in commands:
+            if command.type == CommandType.PLAY_BOOK:
+                input_age = (
+                    max(0.0, time.monotonic() - command.selected_at)
+                    if command.selected_at is not None
+                    else 0
+                )
+                self.last_knob_selection = time.time() - input_age
+            if command.type == CommandType.RETRY_LIBRARY:
+                self.catalogue.refresh_when_online()
+                self.menu.library_error = None
+                continue
+            if command.type == CommandType.CONFIRM_STILL_LISTENING:
+                self.sleep_timer.confirm()
+            if command.type == CommandType.SET_BEDTIME:
+                overlay = arm_bedtime(
+                    self.bedtime, command.timer_minutes, now, self.menu, self.config.sleep_rewind
+                )
+                self.playback.set_sleep_boundary(self.bedtime.chapter_end)
+                continue
+            if command.type == CommandType.LOAD_PODCASTS:
+                if self.podcast_request is None:
+                    self.podcast_config = self.config
+                    self.podcast_request = request_podcast_catalogue(self.podcast_config)
+                overlay = TwoLineFrame("Loading podcasts", "Please wait")
+                continue
+            if command.type == CommandType.LOAD_BOOKMARKS:
+                if self.bookmark_picker.open(self.config, self.menu):
+                    self.screen.overlay = None
+                continue
+            if command.type == CommandType.SAVE_BOOKMARK:
+                self.bookmark_requests.append(self.playback.save_bookmark())
+                overlay = TwoLineFrame("Saving bookmark", "Audiobookshelf")
+                continue
+            command_overlay = handle_menu_command(
+                command, self.menu, self.playback, self.bluetooth.results
+            )
+            if command.type in (
+                CommandType.PAUSE_PLAYBACK,
+                CommandType.END_SELECTION,
+                CommandType.TOGGLE_PLAYBACK,
+                CommandType.SEEK_CHAPTER,
+                CommandType.HOME,
+                CommandType.CONFIRM_STILL_LISTENING,
+            ):
+                self.web_status.publish(self.playback, self.volume, self.muted)
+            self.screen.invalidate_home(now)
+            if command_overlay is not None:
+                overlay = command_overlay
+        return overlay
+
+    def run_web_commands(
+        self, overlay: DisplayFrame | None, now: float, brightness: int
+    ) -> DisplayFrame | None:
+        catalogue_requests: list[WebPlayerCommand] = []
+
+        def request_web_book(web_command: WebPlayerCommand) -> None:
+            nonlocal overlay
+            replacement = handle_web_book_request(
+                web_command, self.last_knob_selection, self.menu, self.playback
+            )
+            if replacement is not None:
+                overlay = replacement
+
+        def set_web_sleep_timer(minutes: int) -> None:
+            nonlocal overlay
+            overlay = arm_bedtime(self.bedtime, minutes, now, self.menu, self.config.sleep_rewind)
+            self.playback.set_sleep_boundary(self.bedtime.chapter_end)
+
+        web_volume, web_muted, web_changed, web_refresh_library = handle_web_player_commands(
+            self.playback,
+            self.menu,
+            self.volume,
+            self.muted,
+            commands=self.web_commands.read(),
+            request_catalogue=catalogue_requests.append,
+            audio_test=self.audio_test,
+            night_volume_limit=self.night_volume_limit,
+            request_book=request_web_book,
+            listening_control=lambda command: apply_listening_control(
+                command,
+                self.playback,
+                self.menu,
+                self.config,
+                set_web_sleep_timer,
+            ),
+        )
+        if web_changed:
+            self.apply_web_control_result(web_volume, web_muted, now, brightness)
+        self.persist_output_volumes()
+        if web_refresh_library:
+            self.catalogue.invalidate()
+        if catalogue_requests:
+            self.catalogue.request_latest(catalogue_requests, load_config(), now)
+        return overlay
+
+    def apply_web_control_result(
+        self, volume: int, muted: bool, now: float, brightness: int
+    ) -> None:
+        self.volume = volume
+        self.muted = muted
+        self.last_volume_state = (self.volume, self.muted)
+        self.screen.invalidate_home(now)
+        if self.playback.is_playing and self.bedtime.sleeping:
+            self.bedtime.cancel()
+        if self.playback.is_playing and (
+            self.sleep_timer.prompt_active or self.sleep_timer.sleeping
+        ):
+            self.sleep_timer.confirm()
+            self.menu.dismiss_sleep_confirmation()
+            self.screen.last_input_at = now
+            self.screen.set_brightness(brightness)
+
+    def persist_output_volumes(self) -> None:
+        output_volumes = self.playback.state.output_volumes
+        if output_volumes is not None and output_volumes != self.saved_output_volumes:
+            try:
+                save_output_volumes(output_volumes)
+                self.saved_output_volumes = output_volumes
+            except OSError as error:
+                print(f"Could not save playback volume: {error}")
+
+    def poll_catalogue(self, now: float) -> None:
+        refreshed = self.catalogue.poll()
+        if refreshed:
+            book_result, effective_config = refreshed
+            if book_result.books is not None and book_result.library is not None:
+                self.config = apply_library_choice(
+                    self.config, effective_config.library_id, effective_config.library_name
+                )
+            self.screen.invalidate_home(now)
+            if book_result.books is not None:
+                self.catalogue_books = book_result.books
+                self.menu.set_library_sort_mode(effective_config.library_sort_mode)
+                self.menu.set_books(
+                    sorted_books_for_menu(
+                        books_with_downloads(
+                            effective_config,
+                            [
+                                *self.catalogue_books,
+                                *(book for book in self.menu.books if book.episode_id),
+                            ],
+                        ),
+                        effective_config.library_sort_mode,
+                    )
+                )
+            elif book_result.error_frame is not None and not self.menu.books:
+                self.menu.library_error = book_result.error_frame
+
+    def advance_book_request(self, overlay: DisplayFrame | None, now: float) -> DisplayFrame | None:
+        playback_result = self.playback.advance_book_request()
+        if not self.playback.loading_book:
+            if self.screen.overlay == BOOK_LOADING_FRAME:
+                self.screen.overlay = None
+            if overlay == BOOK_LOADING_FRAME:
+                overlay = None
+        if playback_result is not None:
+            self.screen.overlay = None
+            self.screen.invalidate_home(now)
+            if playback_result.error_frame is not None:
+                overlay = playback_result.error_frame
+            elif playback_result.session is not None:
+                self.menu.set_session(
+                    playback_result.session,
+                    is_playing=self.playback.is_playing,
+                    session_key=self.playback.state.session_key,
+                )
+                remove_started_book(self.config, playback_result.session)
+                save_playback_state(self.playback)
+                self.last_playback_state_save = now
+                self.web_status.publish(self.playback, self.volume, self.muted)
+        return overlay
+
+    def poll_bookmarks(self, overlay: DisplayFrame | None) -> DisplayFrame | None:
+        self.bookmark_picker.apply_ready(self.config, self.menu)
+        for request in self.bookmark_requests[:]:
+            if request.done():
+                self.bookmark_requests.remove(request)
+                overlay = (
+                    TwoLineFrame("Bookmark saved", "Audiobookshelf")
+                    if request.result()
+                    else TwoLineFrame("Bookmark failed", "Check connection")
+                )
+        return overlay
+
+    def poll_podcasts(self, overlay: DisplayFrame | None) -> DisplayFrame | None:
+        if self.podcast_request and self.podcast_request.done():
+            finished_request = self.podcast_request
+            self.podcast_request = None
+            if self.podcast_config and (
+                progress_account(self.podcast_config) == progress_account(self.config)
+                and self.podcast_config.podcasts == self.config.podcasts
+            ):
+                try:
+                    episodes = finished_request.result()
+                except Exception as error:
+                    print(f"Podcast catalogue request failed: {type(error).__name__}")
+                    overlay = TwoLineFrame("Podcasts unavailable", "Open Podcasts to retry")
+                else:
+                    self.menu.set_books(
+                        [*(book for book in self.menu.books if not book.episode_id), *episodes]
+                    )
+                    overlay = (
+                        None if episodes else TwoLineFrame("No episodes", "Check podcast library")
+                    )
+                    self.screen.overlay = None
+        return overlay
+
+    def poll_spoken_navigation(self) -> None:
+        if self.config.spoken_navigation_enabled:
+            speech_output_device = self.playback.state.audio_output_device
+            if (
+                self.bluetooth.connected
+                and not speech_output_device
+                and self.spoken_navigation.ready_to_start
+            ):
+                speech_output_device = preferred_bluetooth_alsa_device(
+                    self.audio_test.bluetooth_address
+                )
+            self.spoken_navigation.poll(speech_output_device)
+        else:
+            self.spoken_navigation.cancel()
+
+    def poll_playback(
+        self, overlay: DisplayFrame | None, now: float, menu_elapsed: float
+    ) -> DisplayFrame | None:
+        if self.playback.loading_book:
+            if self.playback.state.completed_session is not None:
+                self.completed_session = self.playback.state.completed_session
+            return overlay
+        playback_error_frame = poll_playback_safely(self.playback)
+        if playback_error_frame is not None:
+            overlay = playback_error_frame
+            self.screen.invalidate_home(now)
+        finished = self.playback.state.completed_session
+        if finished is not None and finished is not self.completed_session:
+            self.completed_session = finished
+            can_advance = (
+                not self.muted
+                and not self.bedtime.sleeping
+                and (self.bedtime.deadline is None or now < self.bedtime.deadline)
+            )
+            next_book = finish_naturally(self.menu, self.config, finished, can_advance=can_advance)
+            if next_book is not None:
+                overlay = handle_play_book_command(
+                    MenuCommand(
+                        CommandType.PLAY_BOOK,
+                        book_id=next_book.id,
+                        resume_time=next_book.current_time,
+                    ),
+                    self.menu,
+                    self.playback,
+                )
+            self.screen.home_frame = None
+        self.update_playing_menu(now, menu_elapsed)
+        return overlay
+
+    def update_playing_menu(self, now: float, menu_elapsed: float) -> None:
+        if self.playback.session is not None:
+            self.menu.update_playback(self.playback.current_time, self.playback.is_playing)
+            if now - self.last_playback_state_save >= DEFAULT_PLAYBACK_STATE_SAVE_SECONDS:
+                save_playback_state(self.playback)
+                self.last_playback_state_save = now
+            self.menu.update_title_scroll(
+                menu_elapsed,
+                delay_seconds=DEFAULT_TITLE_SCROLL_DELAY_SECONDS,
+                pixels_per_second=DEFAULT_TITLE_SCROLL_PX_PER_SECOND,
+            )
+            if self.menu.tick_chapter_confirm_timeout(menu_elapsed):
+                self.screen.invalidate_home(now)
+            if self.menu.tick_home_return_timeout(menu_elapsed):
+                self.screen.invalidate_home(now)
+
+    def update_sleep_timers(self, now: float, elapsed: float) -> None:
+        session_id = ""
+        if (session := self.playback.session) is not None:
+            session_id = session.id or session.library_item_id
+        self.update_bedtime(session_id, now)
+        self.update_listening_timer(session_id, now, elapsed)
+
+    def update_bedtime(self, session_id: str, now: float) -> None:
+        sleep_update = self.bedtime.update(
+            session_id=session_id,
+            now=now,
+            position=self.playback.current_time,
+            speed=self.playback.state.playback_rate,
+            playing=self.playback.is_playing,
+        )
+        self.listening_details.publish(
+            self.playback.state, self.menu.undo_position, self.bedtime, self.menu.selected_series
+        )
+        if abs(sleep_update.gain - self.sleep_gain) > 0.001:
+            self.playback.set_sleep_gain(sleep_update.gain)
+            self.sleep_gain = sleep_update.gain
+        if sleep_update.pause:
+            self.playback.sleep_at_position(sleep_update.rewind_to)
+            save_playback_state(self.playback)
+            self.last_playback_state_save = now
+            self.menu.update_playback(self.playback.current_time, False)
+            self.sleep_timer.confirm()
+            self.screen.overlay = None
+            self.screen.overlay_until = 0.0
+
+    def update_listening_timer(self, session_id: str, now: float, elapsed: float) -> None:
+        sleep_event = self.sleep_timer.update(
+            now=now,
+            elapsed_seconds=elapsed,
+            enabled=self.config.sleep_timer_enabled and not self.bedtime.session_id,
+            minutes=self.config.sleep_timer_minutes,
+            session_id=session_id,
+            is_playing=self.playback.is_playing,
+        )
+        apply_sleep_timer_event(
+            sleep_event,
+            self.sleep_timer,
+            now,
+            self.playback,
+            self.menu,
+            self.volume,
+            self.muted,
+            publisher=self.web_status,
+        )
+        if sleep_event == "prompt":
+            self.screen.overlay = None
+            self.screen.overlay_until = 0.0
+            self.screen.last_input_at = now
+
+    def publish_playback_transition(self) -> None:
+        state = self.playback.state
+        if state.is_playing != self.last_is_playing:
+            self.last_is_playing = state.is_playing
+            self.menu.update_playback(state.current_time, state.is_playing)
+            self.web_status.publish(self.playback, self.volume, self.muted)
+
+    def draw_frame(self, status: WifiStatus | None, now: float, brightness: int) -> None:
+        muted = self.muted or self.volume <= 0
+        if self.screen.draw_overlay(now, brightness, muted, self.bluetooth.connected):
+            self.screen.opening_key = (
+                self.playback.opening_key if self.screen.overlay == BOOK_LOADING_FRAME else ""
+            )
+        else:
+            frame = self.screen.menu_frame(
+                self.menu,
+                self.catalogue,
+                self.config,
+                status,
+                now,
+                now - self.started_at < self.startup_network_grace_seconds,
+            )
+            self.screen.draw_menu(
+                frame,
+                self.menu,
+                self.config,
+                now,
+                self.bedtime,
+                self.sleep_timer,
+                brightness,
+                muted,
+                self.bluetooth.connected,
+            )
+            if not isinstance(frame, SplashFrame) and not self.first_menu_drawn:
+                self.first_menu_drawn = True
+                self.gst_runtime.start_warmup()
+                if not effective_muted(self.volume, self.muted):
+                    play_boot_chime(min(self.volume, self.night_volume_limit))
+        self.web_status.publish(self.playback, self.volume, self.muted, display_drawn=True)
+
+    def close(self) -> None:
         with ExitStack() as cleanup:
-            cleanup.callback(shelf.close)
-            cleanup.callback(display.close)
-            if menu is not None:
-                cleanup.callback(menu.speakers.shutdown)
-            cleanup.callback(close_oled_playback, playback, saved_output_volumes)
-            if amp_shutdown is not None:
-                cleanup.callback(amp_shutdown.close)
-            cleanup.callback(spoken_navigation.close)
-            gst_runtime.stop_preloading()
-            if menu is not None:
-                menu.speakers.close()
+            cleanup.callback(self.shelf.close)
+            cleanup.callback(self.screen.display.close)
+            if self.speakers is not None:
+                cleanup.callback(self.speakers.shutdown)
+            cleanup.callback(close_oled_playback, self.playback, self.saved_output_volumes)
+            if self.amp_shutdown is not None:
+                cleanup.callback(self.amp_shutdown.close)
+            cleanup.callback(self.spoken_navigation.close)
+            self.gst_runtime.stop_preloading()
+            if self.speakers is not None:
+                self.speakers.close()
 
 
 def close_oled_playback(playback: PlaybackOwner, saved_volumes: OutputVolumes | None) -> None:
@@ -1653,21 +1578,6 @@ def handle_play_book_command(
 
     playback.request_book(command)
     return BOOK_LOADING_FRAME
-
-
-def start_bluetooth_power_worker(
-    enabled: bool,
-    bluetooth_results: queue.SimpleQueue[BluetoothActionResult],
-) -> None:
-    def run() -> None:
-        try:
-            bluetooth_results.put(set_bluetooth_power(enabled))
-        except Exception:
-            print("Bluetooth power worker failed:")
-            traceback.print_exc()
-            bluetooth_results.put(BluetoothActionResult(False, "Bluetooth error", enabled=None))
-
-    threading.Thread(target=run, daemon=True).start()
 
 
 def should_return_to_active_session(command: MenuCommand, state: PlaybackSnapshot) -> bool:

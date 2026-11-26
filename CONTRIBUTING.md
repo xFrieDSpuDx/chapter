@@ -6,7 +6,9 @@ Describe the behaviour a listener sees, why the change helps and how to verify i
 
 | Area | Code |
 | --- | --- |
-| Turning or pressing the knobs | `oled_input.py` reads the controls. `rotary_ui.py` owns navigation and produces menu commands. `oled_service.py` connects them to the running player. |
+| Turning or pressing the knobs | `oled_input.py` reads the controls. `rotary_ui.py` owns navigation and produces menu commands. In `oled_service.py`, `OledServiceLoop.tick` processes dial commands before web commands and completed book requests. |
+| Choosing what the OLED shows | `oled_presentation.py` handles panel wake, transient messages, the scrolling menu and the screen saver. `oled_display.py` writes the chosen frame to the hardware. |
+| Updating the Bluetooth output | `oled_bluetooth.py` applies the startup status and speaker picker results to the menu and playback output. |
 | Opening bookmarks on the OLED | `oled_bookmarks.py` owns the pending lookup for one opening of the picker. It applies a result only while the same session, account and picker are active. |
 | Refreshing the library on the OLED | `oled_catalogue.py` schedules Audiobookshelf lookups. `oled_shelf.py` checks completed downloads and saved positions in the background. The OLED applies a result to the menu only while its source catalogue, account, sort order and displayed list still match. |
 | Checking device status | `device_status.py` returns the last sample while a worker checks the device. The OLED uses it for Wi-Fi. The dashboard uses it for Wi-Fi and Bluetooth. |

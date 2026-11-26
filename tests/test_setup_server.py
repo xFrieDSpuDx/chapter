@@ -672,7 +672,6 @@ class SetupServerTest(unittest.TestCase):
         for form in forms:
             self.assertIn('name="csrf_token" value="test-csrf-token"', form)
         self.assertIn('meta name="chapter-csrf-token" content="test-csrf-token"', page)
-        self.assertIn('fields["csrf_token"] = csrfToken', page)
         self.assertIn('href="/settings/themes"', page)
 
     def test_themes_page_offers_eight_palettes_with_taupe_and_gold_as_default(self) -> None:

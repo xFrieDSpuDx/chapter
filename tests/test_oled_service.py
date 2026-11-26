@@ -9,7 +9,6 @@ from concurrent.futures import Future
 from datetime import datetime
 from http.client import IncompleteRead
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from abs_kids_player import oled_catalogue, oled_service
@@ -42,6 +41,7 @@ from abs_kids_player.display_frames import (
 )
 from abs_kids_player.listening_timer import ListeningSleepTimer
 from abs_kids_player.models import AudioTrack, Book, Chapter, PlaybackSession
+from abs_kids_player.oled_bluetooth import BluetoothStatusResult, OledBluetooth
 from abs_kids_player.oled_catalogue import BookLoadResult, book_load_result, start_book_load_worker
 from abs_kids_player.oled_input import OledInputQueue
 from abs_kids_player.oled_service import (
@@ -82,6 +82,7 @@ from abs_kids_player.player_control import (
 from abs_kids_player.player_state import LastPlaybackState, load_player_state, save_last_playback
 from abs_kids_player.podcast import podcast_book
 from abs_kids_player.rotary_ui import ApplianceMenu, CommandType, MenuCommand, Screen
+from abs_kids_player.software_update import SoftwareUpdateState
 from abs_kids_player.volume_controls import DEFAULT_UNMUTE_VOLUME_PERCENT
 from abs_kids_player.wifi import SETUP_HOTSPOT_SSID, SETUP_HOTSPOT_URL, WifiStatus
 
@@ -705,11 +706,11 @@ class OledServiceTest(unittest.TestCase):
             if display.show.call_count > 6:
                 shutdown.request(0, None)
 
-        self.run_service(
-            display, OledInputQueue(), AppConfig(screen_saver_dim_percent=5), stop_after_two_frames,
-            screen_saver_is_active=Mock(side_effect=[True, False]),
-            wifi_status=Mock(return_value=WifiStatus(connected=False)),
-        )
+        with patch("abs_kids_player.oled_presentation.screen_saver_is_active", side_effect=[True, False]):
+            self.run_service(
+                display, OledInputQueue(), AppConfig(screen_saver_dim_percent=5), stop_after_two_frames,
+                wifi_status=Mock(return_value=WifiStatus(connected=False)),
+            )
 
         self.assertEqual([call.args[0] for call in display.set_brightness.call_args_list], [73, 100])
         frames = [call.args[0] for call in display.show.call_args_list]
@@ -908,13 +909,8 @@ class OledServiceTest(unittest.TestCase):
             "sleep_until_shutdown": Mock(side_effect=lambda shutdown, seconds, **_options: after_frame(shutdown, seconds)),
             **overrides,
         }
-        queues = SimpleNamespace(
-            SimpleQueue=Mock(side_effect=[queue.SimpleQueue(), queue.SimpleQueue()]),
-            Empty=queue.Empty,
-        )
         with (
             patch.object(oled_service.signal, "signal"),
-            patch.object(oled_service, "queue", queues),
             patch.multiple(oled_catalogue, **catalogue_mocks),
             patch.multiple(oled_service, **mocks),
         ):
@@ -932,6 +928,70 @@ class OledServiceTest(unittest.TestCase):
     def test_software_update_frame_warns_against_powering_off(self) -> None:
         self.assertEqual(SOFTWARE_UPDATE_FRAME.top, "UPDATING")
         self.assertEqual(SOFTWARE_UPDATE_FRAME.bottom, "DO NOT POWER OFF")
+
+    def test_late_bluetooth_probe_preserves_the_output_selected_by_the_listener(self) -> None:
+        bluetooth, menu = OledBluetooth(), ApplianceMenu()
+        playback, audio_test = Mock(), Mock()
+        command = MenuCommand(CommandType.SET_BLUETOOTH_ENABLED, bluetooth_enabled=True)
+        address = "00:11:22:33:44:55"
+
+        bluetooth.apply_startup_status(menu, playback, [command])
+        bluetooth.results.put(
+            BluetoothActionResult(
+                True,
+                "Connected",
+                enabled=True,
+                connected=True,
+                device_address=address,
+            )
+        )
+        bluetooth.apply_actions(menu, playback, audio_test)
+        bluetooth.status_results.put(BluetoothStatusResult(enabled=False, connected=False))
+        changed = bluetooth.apply_startup_status(menu, playback, [])
+
+        self.assertFalse(changed)
+        self.assertTrue(menu.bluetooth_connected)
+        self.assertEqual(audio_test.bluetooth_address, address)
+        playback.set_bluetooth_output_enabled.assert_called_once_with(True, address)
+        playback.refresh_audio_output.assert_called_once_with()
+
+    def test_update_discards_queued_dial_turn_then_controls_resume(self) -> None:
+        display, events = Mock(), OledInputQueue()
+        events.put(InputEvent("volume", 1))
+        web_commands = Mock(return_value=[])
+        acknowledge = Mock(return_value=True)
+        frames = []
+        reads_after_frame = []
+
+        def after_frame(shutdown, seconds):
+            if seconds == 0:
+                return  # The splash delay happens before the first service iteration.
+            frames.append(display.show.call_args.args[0])
+            reads_after_frame.append(web_commands.call_count)
+            if len(frames) == 1:
+                events.put(InputEvent("volume", 1))
+            else:
+                shutdown.request(0, None)
+
+        self.run_service(
+            display,
+            events,
+            AppConfig(),
+            after_frame,
+            load_saved_volume=lambda: VolumeState(3),
+            wifi_status=lambda: WifiStatus(False),
+            DEFAULT_SOFTWARE_UPDATE_REFRESH_SECONDS=0,
+            load_update_state=Mock(
+                side_effect=[SoftwareUpdateState(phase="installing"), SoftwareUpdateState()]
+            ),
+            update_state_is_active=lambda state: True,
+            mark_update_display_ready=acknowledge,
+            consume_web_player_commands=web_commands,
+        )
+
+        self.assertEqual(frames, [SOFTWARE_UPDATE_FRAME, VolumeFrame(4)])
+        self.assertEqual(reads_after_frame, [0, 1])
+        acknowledge.assert_called_once_with()
 
     def test_signal_boot_splash_handoff_writes_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
