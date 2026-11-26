@@ -500,7 +500,7 @@
       <summary>If a test fails</summary>
       <ul class="chapter-guide">
         <li><strong>LED dark.</strong> Check the fuse and the voltage at the power harness in step 5. If the Pi boots, check the LED’s polarity and its two branches.</li>
-        <li><strong>LED on, display blank.</strong> The LED gets power before the Pi boots. Give the Pi time to start, then check the OLED’s feed from Pi pin 1, ground and SPI wires against step 4.</li>
+        <li><strong>LED on, display blank.</strong> The LED gets power before the Pi boots. Give the Pi time to start. On a configured player, press or turn either knob once to wake the screen. If it stays dark, shut down and unplug the player before checking the OLED’s feed from Pi pin 1, ground and SPI wires against step 4.</li>
         <li><strong>Knob turns the wrong way or fails to click.</strong> Check <code>CLK</code> and <code>DT</code> against the diagram for that knob. Check <code>SW</code> and ground if pressing it does nothing.</li>
         <li><strong>Silent speaker.</strong> Check mute and volume, then compare the amp’s three I²S leads, both supply leads and both speaker leads with steps 4 and 5.</li>
       </ul>
