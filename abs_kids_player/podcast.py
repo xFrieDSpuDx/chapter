@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from urllib.error import URLError
@@ -12,6 +14,8 @@ from urllib.request import Request, urlopen
 from .api import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .config import PodcastConfig, default_podcasts
 from .models import AudioTrack, Book, Chapter, PlaybackSession
+from .player_state import state_path
+from .storage import write_json_atomically
 
 
 YOTO_DAILY_BOOK_ID = "podcast:yoto-daily"
@@ -29,6 +33,7 @@ PODCAST_REQUEST_HEADERS = {
     "User-Agent": "ChapterAudiobookPlayer/1.0",
     "Accept": "application/rss+xml, application/xml, text/xml, application/json, */*",
 }
+_PROGRESS_LOCK = threading.Lock()
 
 
 def known_podcast_fallbacks() -> list[PodcastConfig]:
@@ -65,15 +70,61 @@ class PodcastError(RuntimeError):
 
 
 class PodcastProgressClient:
+    def __init__(self, account: str = "", episode_id: str = "") -> None:
+        self.account = account
+        self.episode_id = episode_id
+
     def update_progress(
         self,
-        _item_id: str,
-        _current_time: float,
-        _duration: float,
+        item_id: str,
+        current_time: float,
+        duration: float,
         session_id: str = "",
         time_listened: float = 0,
     ) -> None:
-        return
+        if not self.account or not self.episode_id:
+            return
+        with _PROGRESS_LOCK:
+            progress = podcast_progress()
+            progress[podcast_progress_key(self.account, item_id, self.episode_id)] = {
+                "currentTime": current_time,
+                "lastUpdate": time.time_ns() // 1_000_000,
+                "isFinished": bool(duration and current_time / duration >= 0.995),
+            }
+            write_json_atomically(state_path().with_name("podcast-progress.json"), progress)
+
+
+def podcast_progress() -> dict:
+    try:
+        data = json.loads(state_path().with_name("podcast-progress.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def podcast_progress_key(account: str, book_id: str, episode_id: str) -> str:
+    return f"{account}/{book_id}/{episode_id}"
+
+
+def podcast_episode_id(episode: PodcastEpisode) -> str:
+    return hashlib.sha256((episode.guid or episode.audio_url).encode()).hexdigest()
+
+
+def rss_episode_books(podcast: PodcastConfig, account: str) -> list[Book]:
+    show = podcast_book(podcast)
+    saved = podcast_progress()
+    result = []
+    for episode in read_podcast_episodes(resolve_podcast_feed_url(podcast)):
+        key = podcast_episode_id(episode)
+        progress = saved.get(podcast_progress_key(account, show.id, key), {})
+        result.append(Book(
+            f"{show.id}/{key}", episode.title, show.author, episode.duration, episode.cover_url,
+            current_time=float(progress.get("currentTime") or 0),
+            progress_updated_at=int(progress.get("lastUpdate") or 0),
+            is_finished=bool(progress.get("isFinished")),
+            episode_id=key, podcast_title=show.title, source_item_id=show.id,
+        ))
+    return result
 
 
 def yoto_daily_book() -> Book:
@@ -115,6 +166,9 @@ def latest_podcast_session(
     podcast_or_book_id: PodcastConfig | str,
     resume_time: float = 0.0,
     start_over: bool = False,
+    *,
+    episode_id: str = "",
+    account: str = "",
 ) -> PlaybackSession:
     podcast = podcast_or_book_id
     if isinstance(podcast, str):
@@ -123,13 +177,25 @@ def latest_podcast_session(
             raise PodcastError("Podcast is not configured.")
         podcast = resolved
 
-    episode = latest_episode(resolve_podcast_feed_url(podcast))
-    current_time = 0.0 if start_over else max(0.0, resume_time)
+    feed_url = resolve_podcast_feed_url(podcast)
+    if episode_id:
+        episode = next((episode for episode in read_podcast_episodes(feed_url)
+                        if podcast_episode_id(episode) == episode_id), None)
+        if episode is None:
+            raise PodcastError("Episode is no longer in the feed.")
+    else:
+        episode = latest_episode(feed_url)
+    key = podcast_episode_id(episode)
+    show_id = configured_podcast_book_id(podcast)
+    saved = podcast_progress().get(podcast_progress_key(account, show_id, key), {}) if account else {}
+    fallback = resume_time if episode_id or not account else 0
+    position = saved.get("currentTime", fallback)
+    current_time = 0.0 if start_over else max(0.0, float(position))
     duration = max(episode.duration, current_time)
     return PlaybackSession(
         id=episode.guid or configured_podcast_book_id(podcast),
         library_item_id=configured_podcast_book_id(podcast),
-        title=podcast.title.strip() or podcast_title_from_url(podcast.url or podcast.feed_url),
+        title=episode.title if episode_id else podcast.title.strip() or podcast_title_from_url(podcast.url or podcast.feed_url),
         author=podcast.author.strip(),
         duration=duration,
         current_time=current_time,
@@ -151,6 +217,8 @@ def latest_podcast_session(
                 end=duration,
             )
         ],
+        episode_id=key,
+        progress_account=account,
     )
 
 
@@ -298,7 +366,7 @@ def podcast_feed_metadata(feed_url: str) -> tuple[str, str]:
     return title, author
 
 
-def latest_episode(feed_url: str) -> PodcastEpisode:
+def read_podcast_episodes(feed_url: str) -> list[PodcastEpisode]:
     try:
         with open_podcast_url(feed_url) as response:
             xml = response.read()
@@ -310,20 +378,26 @@ def latest_episode(feed_url: str) -> PodcastEpisode:
     except ET.ParseError as error:
         raise PodcastError("Podcast feed could not be read.") from error
 
-    item = root.find("./channel/item")
-    if item is None:
-        raise PodcastError("Podcast feed has no episodes.")
+    episodes: list[PodcastEpisode] = []
+    for item in root.findall("./channel/item"):
+        enclosure = item.find("enclosure")
+        audio_url = enclosure.get("url", "").strip() if enclosure is not None else ""
+        if not valid_http_url(audio_url):
+            continue
+        episodes.append(PodcastEpisode(
+            title=text_from_child(item, "title") or "Untitled episode",
+            audio_url=audio_url,
+            duration=parse_duration(text_from_child(item, f"{ITUNES_NS}duration")),
+            guid=text_from_child(item, "guid"),
+            cover_url=podcast_image_url(item),
+        ))
+    if not episodes:
+        raise PodcastError("Podcast feed has no playable episodes.")
+    return episodes
 
-    enclosure = item.find("enclosure")
-    audio_url = enclosure.get("url", "").strip() if enclosure is not None else ""
-    if not audio_url:
-        raise PodcastError("Latest podcast episode has no audio.")
 
-    title = text_from_child(item, "title") or "Latest episode"
-    guid = text_from_child(item, "guid")
-    duration = parse_duration(text_from_child(item, f"{ITUNES_NS}duration"))
-    cover_url = podcast_image_url(item)
-    return PodcastEpisode(title=title, audio_url=audio_url, duration=duration, guid=guid, cover_url=cover_url)
+def latest_episode(feed_url: str) -> PodcastEpisode:
+    return read_podcast_episodes(feed_url)[0]
 
 
 def text_from_child(parent: ET.Element, name: str) -> str:
